@@ -108,22 +108,22 @@ public abstract class DhcpPacket {
     /**
      * The client DHCP port.
      */
-    static final short DHCP_CLIENT = (short) 68;
+    public static final short DHCP_CLIENT = (short) 68;
 
     /**
      * The server DHCP port.
      */
-    static final short DHCP_SERVER = (short) 67;
+    public static final short DHCP_SERVER = (short) 67;
 
     /**
      * The message op code indicating a request from a client.
      */
-    protected static final byte DHCP_BOOTREQUEST = (byte) 1;
+    public static final byte DHCP_BOOTREQUEST = (byte) 1;
 
     /**
      * The message op code indicating a response from the server.
      */
-    protected static final byte DHCP_BOOTREPLY = (byte) 2;
+    public static final byte DHCP_BOOTREPLY = (byte) 2;
 
     /**
      * The code type used to identify an Ethernet MAC address in the
@@ -139,7 +139,7 @@ public abstract class DhcpPacket {
     /**
      * The magic cookie that identifies this as a DHCP packet instead of BOOTP.
      */
-    private static final int DHCP_MAGIC_COOKIE = 0x63825363;
+    public static final int DHCP_MAGIC_COOKIE = 0x63825363;
 
     /**
      * DHCP Optional Type: DHCP Subnet Mask
@@ -221,16 +221,16 @@ public abstract class DhcpPacket {
     /**
      * DHCP Optional Type: DHCP Message Type
      */
-    protected static final byte DHCP_MESSAGE_TYPE = 53;
+    public static final byte DHCP_MESSAGE_TYPE = 53;
     // the actual type values
-    protected static final byte DHCP_MESSAGE_TYPE_DISCOVER = 1;
-    protected static final byte DHCP_MESSAGE_TYPE_OFFER = 2;
-    protected static final byte DHCP_MESSAGE_TYPE_REQUEST = 3;
-    protected static final byte DHCP_MESSAGE_TYPE_DECLINE = 4;
-    protected static final byte DHCP_MESSAGE_TYPE_ACK = 5;
-    protected static final byte DHCP_MESSAGE_TYPE_NAK = 6;
-    protected static final byte DHCP_MESSAGE_TYPE_RELEASE = 7;
-    protected static final byte DHCP_MESSAGE_TYPE_INFORM = 8;
+    public static final byte DHCP_MESSAGE_TYPE_DISCOVER = 1;
+    public static final byte DHCP_MESSAGE_TYPE_OFFER = 2;
+    public static final byte DHCP_MESSAGE_TYPE_REQUEST = 3;
+    public static final byte DHCP_MESSAGE_TYPE_DECLINE = 4;
+    public static final byte DHCP_MESSAGE_TYPE_ACK = 5;
+    public static final byte DHCP_MESSAGE_TYPE_NAK = 6;
+    public static final byte DHCP_MESSAGE_TYPE_RELEASE = 7;
+    public static final byte DHCP_MESSAGE_TYPE_INFORM = 8;
 
     /**
      * DHCP Optional Type: DHCP Server Identifier
@@ -279,6 +279,13 @@ public abstract class DhcpPacket {
      */
     protected static final byte DHCP_CLIENT_IDENTIFIER = 61;
     protected byte[] mClientId;
+
+    /**
+     * DHCP zero-length Optional Type: Rapid Commit. Per RFC4039, both DHCPDISCOVER and DHCPACK
+     * packet may include this option.
+     */
+    protected static final byte DHCP_RAPID_COMMIT = 80;
+    protected boolean mRapidCommit;
 
     /**
      * DHCP zero-length option code: pad
@@ -605,6 +612,14 @@ public abstract class DhcpPacket {
     }
 
     /**
+     * Adds an optional parameter containing zero-length value.
+     */
+    protected static void addTlv(ByteBuffer buf, byte type) {
+        buf.put(type);
+        buf.put((byte) 0);
+    }
+
+    /**
      * Adds an optional parameter containing an array of bytes.
      *
      * <p>This method is a no-op if the payload argument is null.
@@ -858,6 +873,7 @@ public abstract class DhcpPacket {
         String message = null;
         String vendorId = null;
         String vendorInfo = null;
+        boolean rapidCommit = false;
         byte[] expectedParams = null;
         String hostName = null;
         String domainName = null;
@@ -1126,6 +1142,10 @@ public abstract class DhcpPacket {
                             optionOverload = packet.get();
                             optionOverload &= OPTION_OVERLOAD_BOTH;
                             break;
+                        case DHCP_RAPID_COMMIT:
+                            expectedLen = 0;
+                            rapidCommit = true;
+                            break;
                         default:
                             // ignore any other parameters
                             for (int i = 0; i < optionLen; i++) {
@@ -1216,6 +1236,7 @@ public abstract class DhcpPacket {
         newPacket.mT2 = T2;
         newPacket.mVendorId = vendorId;
         newPacket.mVendorInfo = vendorInfo;
+        newPacket.mRapidCommit = rapidCommit;
         if ((optionOverload & OPTION_OVERLOAD_SNAME) == 0) {
             newPacket.mServerHostName = serverHostName;
         } else {
@@ -1304,10 +1325,12 @@ public abstract class DhcpPacket {
      * parameters.
      */
     public static ByteBuffer buildDiscoverPacket(int encap, int transactionId,
-        short secs, byte[] clientMac, boolean broadcast, byte[] expectedParams) {
+            short secs, byte[] clientMac, boolean broadcast, byte[] expectedParams,
+            boolean rapidCommit) {
         DhcpPacket pkt = new DhcpDiscoverPacket(transactionId, secs, INADDR_ANY /* relayIp */,
                 clientMac, broadcast, INADDR_ANY /* srcIp */);
         pkt.mRequestedParams = expectedParams;
+        pkt.mRapidCommit = rapidCommit;
         return pkt.buildPacket(encap, DHCP_SERVER, DHCP_CLIENT);
     }
 

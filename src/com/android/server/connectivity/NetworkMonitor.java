@@ -65,6 +65,7 @@ import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
 import static android.net.util.NetworkStackUtils.NAMESPACE_CONNECTIVITY;
 import static android.net.util.NetworkStackUtils.isEmpty;
 
+import static com.android.networkstack.util.DnsUtils.PRIVATE_DNS_PROBE_HOST_SUFFIX;
 import static com.android.networkstack.util.DnsUtils.TYPE_ADDRCONFIG;
 
 import android.annotation.NonNull;
@@ -1044,12 +1045,11 @@ public class NetworkMonitor extends StateMachine {
             try {
                 // Do a blocking DNS resolution using the network-assigned nameservers.
                 final InetAddress[] ips = DnsUtils.getAllByName(mDependencies.getDnsResolver(),
-                        mCleartextDnsNetwork, mPrivateDnsProviderHostname, getDnsProbeTimeout());
+                        mCleartextDnsNetwork, mPrivateDnsProviderHostname, getDnsProbeTimeout(),
+                        str -> validationLog("Strict mode hostname resolution " + str));
                 mPrivateDnsConfig = new PrivateDnsConfig(mPrivateDnsProviderHostname, ips);
-                validationLog("Strict mode hostname resolved: " + mPrivateDnsConfig);
             } catch (UnknownHostException uhe) {
                 mPrivateDnsConfig = null;
-                validationLog("Strict mode hostname resolution failed: " + uhe.getMessage());
             }
             mEvaluationState.noteProbeResult(NETWORK_VALIDATION_PROBE_PRIVDNS,
                     (mPrivateDnsConfig != null) /* succeeded */);
@@ -1084,10 +1084,8 @@ public class NetworkMonitor extends StateMachine {
         }
 
         private boolean sendPrivateDnsProbe() {
-            // q.v. system/netd/server/dns/DnsTlsTransport.cpp
-            final String oneTimeHostnameSuffix = "-dnsotls-ds.metric.gstatic.com";
             final String host = UUID.randomUUID().toString().substring(0, 8)
-                    + oneTimeHostnameSuffix;
+                    + PRIVATE_DNS_PROBE_HOST_SUFFIX;
             final Stopwatch watch = new Stopwatch().start();
             boolean success = false;
             long time;
@@ -1153,7 +1151,6 @@ public class NetworkMonitor extends StateMachine {
                     } else if (probeResult.isPartialConnectivity()) {
                         mEvaluationState.reportEvaluationResult(NETWORK_VALIDATION_RESULT_PARTIAL,
                                 null /* redirectUrl */);
-                        // Check if disable https probing needed.
                         maybeDisableHttpsProbing(mAcceptPartialConnectivity);
                         if (mAcceptPartialConnectivity) {
                             transitionTo(mEvaluatingPrivateDnsState);
@@ -1557,7 +1554,8 @@ public class NetworkMonitor extends StateMachine {
     protected InetAddress[] sendDnsProbeWithTimeout(String host, int timeoutMs)
                 throws UnknownHostException {
         return DnsUtils.getAllByName(mDependencies.getDnsResolver(), mCleartextDnsNetwork, host,
-                TYPE_ADDRCONFIG, FLAG_EMPTY, timeoutMs);
+                TYPE_ADDRCONFIG, FLAG_EMPTY, timeoutMs,
+                str -> validationLog(ValidationProbeEvent.PROBE_DNS, host, str));
     }
 
     /** Do a DNS resolution of the given server. */
@@ -1572,19 +1570,11 @@ public class NetworkMonitor extends StateMachine {
         String connectInfo;
         try {
             InetAddress[] addresses = sendDnsProbeWithTimeout(host, getDnsProbeTimeout());
-            StringBuffer buffer = new StringBuffer();
-            for (InetAddress address : addresses) {
-                buffer.append(',').append(address.getHostAddress());
-            }
             result = ValidationProbeEvent.DNS_SUCCESS;
-            connectInfo = "OK " + buffer.substring(1);
         } catch (UnknownHostException e) {
             result = ValidationProbeEvent.DNS_FAILURE;
-            connectInfo = "FAIL";
         }
         final long latency = watch.stop();
-        validationLog(ValidationProbeEvent.PROBE_DNS, host,
-                String.format("%dms %s", latency, connectInfo));
         logValidationProbe(latency, ValidationProbeEvent.PROBE_DNS, result);
     }
 
@@ -2174,5 +2164,15 @@ public class NetworkMonitor extends StateMachine {
             probeResult |= NETWORK_VALIDATION_PROBE_DNS;
         }
         mEvaluationState.noteProbeResult(probeResult, succeeded);
+    }
+
+    /**
+     * Interface for logging dns results.
+     */
+    public interface DnsLogFunc {
+        /**
+         * Log function.
+         */
+        void log(String s);
     }
 }
