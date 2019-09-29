@@ -19,7 +19,7 @@ package android.net.ip;
 import static android.net.RouteInfo.RTN_UNICAST;
 import static android.net.shared.IpConfigurationParcelableUtil.toStableParcelable;
 
-import static com.android.server.util.PermissionUtil.checkNetworkStackCallingPermission;
+import static com.android.server.util.PermissionUtil.enforceNetworkStackCallingPermission;
 
 import android.annotation.NonNull;
 import android.content.Context;
@@ -48,6 +48,7 @@ import android.os.ConditionVariable;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.RemoteException;
+import android.os.ServiceSpecificException;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.LocalLog;
@@ -514,67 +515,67 @@ public class IpClient extends StateMachine {
     class IpClientConnector extends IIpClient.Stub {
         @Override
         public void completedPreDhcpAction() {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.completedPreDhcpAction();
         }
         @Override
         public void confirmConfiguration() {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.confirmConfiguration();
         }
         @Override
         public void readPacketFilterComplete(byte[] data) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.readPacketFilterComplete(data);
         }
         @Override
         public void shutdown() {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.shutdown();
         }
         @Override
         public void startProvisioning(ProvisioningConfigurationParcelable req) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.startProvisioning(ProvisioningConfiguration.fromStableParcelable(req));
         }
         @Override
         public void stop() {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.stop();
         }
         @Override
         public void setL2KeyAndGroupHint(String l2Key, String groupHint) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.setL2KeyAndGroupHint(l2Key, groupHint);
         }
         @Override
         public void setTcpBufferSizes(String tcpBufferSizes) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.setTcpBufferSizes(tcpBufferSizes);
         }
         @Override
         public void setHttpProxy(ProxyInfo proxyInfo) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.setHttpProxy(proxyInfo);
         }
         @Override
         public void setMulticastFilter(boolean enabled) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.setMulticastFilter(enabled);
         }
         @Override
         public void addKeepalivePacketFilter(int slot, TcpKeepalivePacketDataParcelable pkt) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.addKeepalivePacketFilter(slot, pkt);
         }
         @Override
         public void addNattKeepalivePacketFilter(int slot, NattKeepalivePacketDataParcelable pkt) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.addNattKeepalivePacketFilter(slot, pkt);
         }
         @Override
         public void removeKeepalivePacketFilter(int slot) {
-            checkNetworkStackCallingPermission();
+            enforceNetworkStackCallingPermission();
             IpClient.this.removeKeepalivePacketFilter(slot);
         }
 
@@ -850,10 +851,12 @@ public class IpClient extends StateMachine {
         return shouldLog;
     }
 
+    private void logError(String fmt, Throwable e, Object... args) {
+        mLog.e(String.format(fmt, args), e);
+    }
+
     private void logError(String fmt, Object... args) {
-        final String msg = "ERROR " + String.format(fmt, args);
-        Log.e(mTag, msg);
-        mLog.log(msg);
+        logError(fmt, null, args);
     }
 
     // This needs to be called with care to ensure that our LinkProperties
@@ -1274,6 +1277,28 @@ public class IpClient extends StateMachine {
         // TODO : implement this
     }
 
+    private void maybeRestoreInterfaceMtu() {
+        InterfaceParams params = mDependencies.getInterfaceParams(mInterfaceName);
+        if (params == null) {
+            Log.w(mTag, "interface: " + mInterfaceName + " is gone");
+            return;
+        }
+
+        if (params.index != mInterfaceParams.index) {
+            Log.w(mTag, "interface: " + mInterfaceName + " has a different index: " + params.index);
+            return;
+        }
+
+        if (params.defaultMtu != mInterfaceParams.defaultMtu) {
+            try {
+                mNetd.interfaceSetMtu(mInterfaceName, mInterfaceParams.defaultMtu);
+            } catch (RemoteException | ServiceSpecificException e) {
+                logError("Couldn't reset MTU on " + mInterfaceName + " from "
+                        + params.defaultMtu + " to " + mInterfaceParams.defaultMtu, e);
+            }
+        }
+    }
+
     class StoppedState extends State {
         @Override
         public void enter() {
@@ -1351,6 +1376,9 @@ public class IpClient extends StateMachine {
                 // There's no DHCPv4 for which to wait; proceed to stopped.
                 deferMessage(obtainMessage(CMD_JUMP_STOPPING_TO_STOPPED));
             }
+
+            // Restore the interface MTU to initial value if it has changed.
+            maybeRestoreInterfaceMtu();
         }
 
         @Override
