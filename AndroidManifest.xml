@@ -19,7 +19,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
   package="com.android.networkstack"
   android:sharedUserId="android.uid.networkstack"
-  android:versionCode="290000000"
+  android:versionCode="300000000"
   android:versionName="2019-09"
 >
 
@@ -44,7 +44,8 @@
     <application
         android:extractNativeLibs="false"
         android:persistent="true">
-        <service android:name="com.android.server.NetworkStackService">
+        <service android:name="com.android.server.NetworkStackService"
+                 android:permission="android.permission.MAINLINE_NETWORK_STACK">
             <intent-filter>
                 <action android:name="android.net.INetworkStackConnector"/>
             </intent-filter>
