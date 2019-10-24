@@ -50,6 +50,7 @@ import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.INetd;
 import android.net.InetAddresses;
+import android.net.LinkProperties;
 import android.net.NetworkStackIpMemoryStore;
 import android.net.TestNetworkInterface;
 import android.net.TestNetworkManager;
@@ -69,6 +70,8 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.ParcelFileDescriptor;
 import android.os.RemoteException;
+import android.system.ErrnoException;
+import android.system.Os;
 
 import androidx.annotation.Nullable;
 import androidx.test.InstrumentationRegistry;
@@ -127,6 +130,7 @@ public class IpClientIntegrationTest {
     private String mIfaceName;
     private INetd mNetd;
     private HandlerThread mPacketReaderThread;
+    private Handler mHandler;
     private TapPacketReader mPacketReader;
     private IpClient mIpc;
     private Dependencies mDependencies;
@@ -268,7 +272,7 @@ public class IpClientIntegrationTest {
     @After
     public void tearDown() throws Exception {
         if (mPacketReader != null) {
-            mPacketReader.stop(); // Also closes the socket
+            mHandler.post(() -> mPacketReader.stop()); // Also closes the socket
         }
         if (mPacketReaderThread != null) {
             mPacketReaderThread.quitSafely();
@@ -294,10 +298,11 @@ public class IpClientIntegrationTest {
         mIfaceName = iface.getInterfaceName();
         mPacketReaderThread = new HandlerThread(IpClientIntegrationTest.class.getSimpleName());
         mPacketReaderThread.start();
+        mHandler = mPacketReaderThread.getThreadHandler();
 
         final ParcelFileDescriptor tapFd = iface.getFileDescriptor();
-        mPacketReader = new TapPacketReader(mPacketReaderThread.getThreadHandler(), tapFd);
-        mPacketReader.start();
+        mPacketReader = new TapPacketReader(mHandler, tapFd);
+        mHandler.post(() -> mPacketReader.start());
     }
 
     private void setUpIpClient() throws Exception {
@@ -395,8 +400,8 @@ public class IpClientIntegrationTest {
         mDependencies.setDhcpRapidCommitEnabled(isDhcpRapidCommitEnabled);
         mIpc.setL2KeyAndGroupHint(TEST_L2KEY, TEST_GROUPHINT);
         mIpc.startProvisioning(config);
-        verify(mCb, times(1)).setNeighborDiscoveryOffload(true);
-        verify(mCb, timeout(TEST_TIMEOUT_MS).times(1)).setFallbackMulticastFilter(false);
+        verify(mCb).setNeighborDiscoveryOffload(true);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).setFallbackMulticastFilter(false);
         verify(mCb, never()).onProvisioningFailure(any());
     }
 
@@ -478,7 +483,22 @@ public class IpClientIntegrationTest {
         return getNextDhcpPacket();
     }
 
-    private void doRestoreInitialMtuTest(final boolean shouldChangeMtu) throws Exception {
+    private void removeTapInterface(final FileDescriptor fd) {
+        try {
+            Os.close(fd);
+        } catch (ErrnoException e) {
+            fail("Fail to close file descriptor: " + e);
+        }
+    }
+
+    private void verifyAfterIpClientShutdown() throws RemoteException {
+        final LinkProperties emptyLp = new LinkProperties();
+        emptyLp.setInterfaceName(mIfaceName);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(emptyLp);
+    }
+
+    private void doRestoreInitialMtuTest(final boolean shouldChangeMtu,
+            final boolean shouldRemoveTapInterface) throws Exception {
         final long currentTime = System.currentTimeMillis();
         int mtu = TEST_DEFAULT_MTU;
 
@@ -493,11 +513,21 @@ public class IpClientIntegrationTest {
             assertEquals(NetworkInterface.getByName(mIfaceName).getMTU(), mtu);
         }
 
-        mIpc.shutdown();
-        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
-        // Verify that MTU indeed has been restored or not.
-        verify(mMockNetd, times(shouldChangeMtu ? 1 : 0)).interfaceSetMtu(mIfaceName,
-                TEST_DEFAULT_MTU);
+        if (shouldRemoveTapInterface) removeTapInterface(mPacketReader.createFd());
+        try {
+            mIpc.shutdown();
+            HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
+            if (shouldRemoveTapInterface) {
+                verify(mMockNetd, never()).interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
+            } else {
+                // Verify that MTU indeed has been restored or not.
+                verify(mMockNetd, times(shouldChangeMtu ? 1 : 0))
+                        .interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
+            }
+            verifyAfterIpClientShutdown();
+        } catch (Exception e) {
+            fail("Exception should not have been thrown after shutdown: " + e);
+        }
     }
 
     @Test
@@ -628,20 +658,39 @@ public class IpClientIntegrationTest {
 
     @Test
     public void testRestoreInitialInterfaceMtu() throws Exception {
-        doRestoreInitialMtuTest(true /* shouldChangeMtu */);
+        doRestoreInitialMtuTest(true /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
     }
 
     @Test
-    public void testRestoreInitialInterfaceMtuWithoutChange() throws Exception {
-        doRestoreInitialMtuTest(false /* shouldChangeMtu */);
+    public void testRestoreInitialInterfaceMtu_WithoutMtuChange() throws Exception {
+        doRestoreInitialMtuTest(false /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
     }
 
     @Test
-    public void testRestoreInitialInterfaceMtuWithException() throws Exception {
+    public void testRestoreInitialInterfaceMtu_WithException() throws Exception {
         doThrow(new RemoteException("NetdNativeService::interfaceSetMtu")).when(mMockNetd)
                 .interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
 
-        doRestoreInitialMtuTest(true /* shouldChangeMtu */);
+        doRestoreInitialMtuTest(true /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
         assertEquals(NetworkInterface.getByName(mIfaceName).getMTU(), TEST_MIN_MTU);
+    }
+
+    @Test
+    public void testRestoreInitialInterfaceMtu_NotFoundInterfaceWhenStopping() throws Exception {
+        doRestoreInitialMtuTest(true /* shouldChangeMtu */, true /* shouldRemoveTapInterface */);
+    }
+
+    @Test
+    public void testRestoreInitialInterfaceMtu_NotFoundInterfaceWhenStartingProvisioning()
+            throws Exception {
+        removeTapInterface(mPacketReader.createFd());
+        ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .withoutIPv6()
+                .build();
+
+        mIpc.startProvisioning(config);
+        verify(mCb).onProvisioningFailure(any());
+        verify(mCb, never()).setNeighborDiscoveryOffload(true);
     }
 }
