@@ -22,6 +22,7 @@ android_test {
     resource_dirs: ["res"],
     static_libs: [
         "androidx.test.rules",
+        "kotlin-reflect",
         "mockito-target-extended-minus-junit4",
         "net-tests-utils",
         "NetworkStackApiCurrentLib",
@@ -60,8 +61,6 @@ java_defaults {
         "libdl_android",
         "libhidl-gen-utils",
         "libhidlbase",
-        "libhidltransport",
-        "libhwbinder",
         "libjsoncpp",
         "liblog",
         "liblzma",
