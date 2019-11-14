@@ -14,23 +14,14 @@
  * limitations under the License.
  */
 
-package com.android.networkstack.apishim;
+package com.android.testutils
 
-import android.net.util.SocketUtils;
-
-import androidx.annotation.NonNull;
-
-import java.net.SocketAddress;
-
-/**
- * Implementation of {@link SocketUtilsShim} for API 30.
- */
-public class SocketUtilsShimImpl implements SocketUtilsShim {
-    @NonNull
-    @Override
-    public SocketAddress makePacketSocketAddress(
-            int protocol, int ifIndex, @NonNull byte[] hwAddr) {
-        // TODO: use new API (which takes protocol, ifIndex, hwAddr) once implemented
-        return SocketUtils.makePacketSocketAddress(ifIndex, hwAddr);
-    }
+// This function is private because the 2 is hardcoded here, and is not correct if not called
+// directly from __LINE__ or __FILE__.
+private fun callerStackTrace(): StackTraceElement = try {
+    throw RuntimeException()
+} catch (e: RuntimeException) {
+    e.stackTrace[2] // 0 is here, 1 is get() in __FILE__ or __LINE__
 }
+val __FILE__: String get() = callerStackTrace().fileName
+val __LINE__: Int get() = callerStackTrace().lineNumber
