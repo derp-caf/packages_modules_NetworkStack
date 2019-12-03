@@ -30,8 +30,10 @@ import static android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_EVALUATION_TYPE;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_MIN_EVALUATE_INTERVAL;
+import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_TCP_POLLING_INTERVAL;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_VALID_DNS_TIME_THRESHOLD;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_DNS;
+import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_TCP;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_OTHER_FALLBACK_URLS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_USE_HTTPS;
@@ -96,6 +98,7 @@ import com.android.internal.util.CollectionUtils;
 import com.android.networkstack.R;
 import com.android.networkstack.metrics.DataStallDetectionStats;
 import com.android.networkstack.metrics.DataStallStatsUtils;
+import com.android.networkstack.netlink.TcpSocketTracker;
 import com.android.testutils.HandlerUtilsKt;
 
 import org.junit.After;
@@ -150,7 +153,8 @@ public class NetworkMonitorTest {
     private @Mock DataStallStatsUtils mDataStallStatsUtils;
     private @Mock WifiInfo mWifiInfo;
     private @Captor ArgumentCaptor<String> mNetworkTestedRedirectUrlCaptor;
-
+    private @Mock TcpSocketTracker.Dependencies mTstDependencies;
+    private @Mock TcpSocketTracker mTst;
     private HashSet<WrappedNetworkMonitor> mCreatedNetworkMonitors;
     private HashSet<BroadcastReceiver> mRegisteredReceivers;
 
@@ -448,7 +452,7 @@ public class NetworkMonitorTest {
 
         WrappedNetworkMonitor() {
             super(mContext, mCallbacks, mNetwork, mLogger, mValidationLogger,
-                    mDependencies, mDataStallStatsUtils);
+                    mDependencies, mDataStallStatsUtils, mTst);
         }
 
         @Override
@@ -458,6 +462,11 @@ public class NetworkMonitorTest {
 
         protected void setLastProbeTime(long time) {
             mProbeTime = time;
+        }
+
+        @Override
+        protected TcpSocketTracker getTcpSocketTracker() {
+            return mTst;
         }
 
         @Override
@@ -483,6 +492,8 @@ public class NetworkMonitorTest {
         setNetworkCapabilities(nm, nc);
         HandlerUtilsKt.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
         mCreatedNetworkMonitors.add(nm);
+        when(mTstDependencies.isTcpInfoParsingSupported()).thenReturn(false);
+
         return nm;
     }
 
@@ -731,6 +742,32 @@ public class NetworkMonitorTest {
         assertFalse(wrappedMonitor.isDataStall());
         wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
         assertFalse(wrappedMonitor.isDataStall());
+    }
+
+    @Test
+    public void testIsDataStall_EvaluationTcp() {
+        // Evaluate TCP only. Expect ignoring DNS signal.
+        setDataStallEvaluationType(DATA_STALL_EVALUATION_TYPE_TCP);
+        WrappedNetworkMonitor wrappedMonitor = makeMonitor(METERED_CAPABILITIES);
+        // Condition met for DNS.
+        wrappedMonitor.setLastProbeTime(SystemClock.elapsedRealtime() - 1000);
+        makeDnsTimeoutEvent(wrappedMonitor, DEFAULT_DNS_TIMEOUT_THRESHOLD);
+        assertFalse(wrappedMonitor.isDataStall());
+        // Packet received.
+        when(mTstDependencies.isTcpInfoParsingSupported()).thenReturn(true);
+        when(mTst.getLatestReceivedCount()).thenReturn(5);
+        // Trigger a tcp event immediately.
+        setTcpPollingInterval(0);
+        wrappedMonitor.sendTcpPollingEvent();
+        HandlerUtilsKt.waitForIdle(wrappedMonitor.getHandler(), HANDLER_TIMEOUT_MS);
+        assertFalse(wrappedMonitor.isDataStall());
+        when(mTst.getLatestReceivedCount()).thenReturn(0);
+        when(mTst.isDataStallSuspected()).thenReturn(true);
+        // Trigger a tcp event immediately.
+        setTcpPollingInterval(0);
+        wrappedMonitor.sendTcpPollingEvent();
+        HandlerUtilsKt.waitForIdle(wrappedMonitor.getHandler(), HANDLER_TIMEOUT_MS);
+        assertTrue(wrappedMonitor.isDataStall());
     }
 
     @Test
@@ -1152,6 +1189,11 @@ public class NetworkMonitorTest {
     private void setConsecutiveDnsTimeoutThreshold(int num) {
         when(mDependencies.getDeviceConfigPropertyInt(any(),
             eq(CONFIG_DATA_STALL_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD), anyInt())).thenReturn(num);
+    }
+
+    private void setTcpPollingInterval(int time) {
+        when(mDependencies.getDeviceConfigPropertyInt(any(),
+                eq(CONFIG_DATA_STALL_TCP_POLLING_INTERVAL), anyInt())).thenReturn(time);
     }
 
     private void setFallbackUrl(String url) {

@@ -51,11 +51,13 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.any;
+import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -103,7 +105,6 @@ import androidx.test.runner.AndroidJUnit4;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 import com.android.server.connectivity.ipmemorystore.IpMemoryStoreService;
-import com.android.testutils.HandlerUtilsKt;
 
 import org.junit.After;
 import org.junit.Before;
@@ -113,6 +114,7 @@ import org.junit.runner.RunWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.MockitoAnnotations;
+import org.mockito.Spy;
 
 import java.io.FileDescriptor;
 import java.io.FileOutputStream;
@@ -142,7 +144,6 @@ public class IpClientIntegrationTest {
 
     @Mock private Context mContext;
     @Mock private ConnectivityManager mCm;
-    @Mock private INetd mMockNetd;
     @Mock private Resources mResources;
     @Mock private IIpClientCallbacks mCb;
     @Mock private AlarmManager mAlarm;
@@ -151,8 +152,9 @@ public class IpClientIntegrationTest {
     @Mock private NetworkStackIpMemoryStore mIpMemoryStore;
     @Mock private IpMemoryStoreService mIpMemoryStoreService;
 
+    @Spy private INetd mNetd;
+
     private String mIfaceName;
-    private INetd mNetd;
     private HandlerThread mPacketReaderThread;
     private Handler mHandler;
     private TapPacketReader mPacketReader;
@@ -249,7 +251,7 @@ public class IpClientIntegrationTest {
 
         @Override
         public INetd getNetd(Context context) {
-            return mMockNetd;
+            return mNetd;
         }
 
         @Override
@@ -310,6 +312,10 @@ public class IpClientIntegrationTest {
         setUpIpClient();
     }
 
+    private void awaitIpClientShutdown() throws Exception {
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onQuit();
+    }
+
     @After
     public void tearDown() throws Exception {
         if (mPacketReader != null) {
@@ -319,6 +325,7 @@ public class IpClientIntegrationTest {
             mPacketReaderThread.quitSafely();
         }
         mIpc.shutdown();
+        awaitIpClientShutdown();
     }
 
     private void setUpTapInterface() {
@@ -350,7 +357,7 @@ public class IpClientIntegrationTest {
         final Instrumentation inst = InstrumentationRegistry.getInstrumentation();
         final IBinder netdIBinder =
                 (IBinder) inst.getContext().getSystemService(Context.NETD_SERVICE);
-        mNetd = INetd.Stub.asInterface(netdIBinder);
+        mNetd = spy(INetd.Stub.asInterface(netdIBinder));
         when(mContext.getSystemService(eq(Context.NETD_SERVICE))).thenReturn(netdIBinder);
         assertNotNull(mNetd);
 
@@ -560,12 +567,12 @@ public class IpClientIntegrationTest {
         if (shouldRemoveTapInterface) removeTapInterface(mPacketReader.createFd());
         try {
             mIpc.shutdown();
-            HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
+            awaitIpClientShutdown();
             if (shouldRemoveTapInterface) {
-                verify(mMockNetd, never()).interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
+                verify(mNetd, never()).interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
             } else {
                 // Verify that MTU indeed has been restored or not.
-                verify(mMockNetd, times(shouldChangeMtu ? 1 : 0))
+                verify(mNetd, times(shouldChangeMtu ? 1 : 0))
                         .interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
             }
             verifyAfterIpClientShutdown();
@@ -712,7 +719,7 @@ public class IpClientIntegrationTest {
 
     @Test
     public void testRestoreInitialInterfaceMtu_WithException() throws Exception {
-        doThrow(new RemoteException("NetdNativeService::interfaceSetMtu")).when(mMockNetd)
+        doThrow(new RemoteException("NetdNativeService::interfaceSetMtu")).when(mNetd)
                 .interfaceSetMtu(mIfaceName, TEST_DEFAULT_MTU);
 
         doRestoreInitialMtuTest(true /* shouldChangeMtu */, false /* shouldRemoveTapInterface */);
@@ -913,4 +920,49 @@ public class IpClientIntegrationTest {
 
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningFailure(captor.capture());
         lp = captor.getValue();
-    }}
+        assertNotNull(lp);
+        assertEquals(0, lp.getDnsServers().size());
+        reset(mCb);
+    }
+
+    @Test
+    public void testIpClientClearingIpAddressState() throws Exception {
+        final long currentTime = System.currentTimeMillis();
+        performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
+                true /* isDhcpLeaseCacheEnabled */, false /* isDhcpRapidCommitEnabled */,
+                TEST_DEFAULT_MTU);
+        assertIpMemoryStoreNetworkAttributes(TEST_LEASE_DURATION_S, currentTime, TEST_DEFAULT_MTU);
+
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        LinkProperties lp = captor.getValue();
+        assertNotNull(lp);
+        assertEquals(1, lp.getAddresses().size());
+        assertTrue(lp.getAddresses().contains(InetAddress.getByName(CLIENT_ADDR.getHostAddress())));
+
+        // Stop IpClient and expect a final LinkProperties callback with an empty LP.
+        mIpc.stop();
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onLinkPropertiesChange(argThat(
+                x -> x.getAddresses().size() == 0
+                        && x.getRoutes().size() == 0
+                        && x.getDnsServers().size() == 0));
+        reset(mCb);
+
+        // Pretend that something else (e.g., Tethering) used the interface and left an IP address
+        // configured on it. When IpClient starts, it must clear this address before proceeding.
+        // TODO: test IPv6 instead, since the DHCP client will remove this address by replacing it
+        // with the new address.
+        mNetd.interfaceAddAddress(mIfaceName, "192.0.2.99", 26);
+
+        // start IpClient again and should enter Clearing State and wait for the message from kernel
+        performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
+                true /* isDhcpLeaseCacheEnabled */, false /* isDhcpRapidCommitEnabled */,
+                TEST_DEFAULT_MTU);
+
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        lp = captor.getValue();
+        assertNotNull(lp);
+        assertEquals(1, lp.getAddresses().size());
+        assertTrue(lp.getAddresses().contains(InetAddress.getByName(CLIENT_ADDR.getHostAddress())));
+    }
+}
