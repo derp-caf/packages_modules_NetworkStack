@@ -45,13 +45,16 @@ import static android.net.metrics.ValidationProbeEvent.PROBE_PRIVDNS;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_EVALUATION_TYPE;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_MIN_EVALUATE_INTERVAL;
+import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_TCP_POLLING_INTERVAL;
 import static android.net.util.DataStallUtils.CONFIG_DATA_STALL_VALID_DNS_TIME_THRESHOLD;
 import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_DNS;
+import static android.net.util.DataStallUtils.DATA_STALL_EVALUATION_TYPE_TCP;
 import static android.net.util.DataStallUtils.DEFAULT_CONSECUTIVE_DNS_TIMEOUT_THRESHOLD;
 import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_EVALUATION_TYPES;
 import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_MIN_EVALUATE_TIME_MS;
 import static android.net.util.DataStallUtils.DEFAULT_DATA_STALL_VALID_DNS_TIME_THRESHOLD_MS;
 import static android.net.util.DataStallUtils.DEFAULT_DNS_LOG_SIZE;
+import static android.net.util.DataStallUtils.DEFAULT_TCP_POLLING_INTERVAL_MS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_FALLBACK_PROBE_SPECS;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_FALLBACK_URL;
 import static android.net.util.NetworkStackUtils.CAPTIVE_PORTAL_HTTPS_URL;
@@ -123,8 +126,10 @@ import com.android.internal.util.State;
 import com.android.internal.util.StateMachine;
 import com.android.internal.util.TrafficStatsConstants;
 import com.android.networkstack.R;
+import com.android.networkstack.apishim.ShimUtils;
 import com.android.networkstack.metrics.DataStallDetectionStats;
 import com.android.networkstack.metrics.DataStallStatsUtils;
+import com.android.networkstack.netlink.TcpSocketTracker;
 import com.android.networkstack.util.DnsUtils;
 
 import java.io.IOException;
@@ -273,6 +278,10 @@ public class NetworkMonitor extends StateMachine {
      */
     private static final int EVENT_NETWORK_CAPABILITIES_CHANGED = 20;
 
+    /**
+     * Message to self to poll current tcp status from kernel.
+     */
+    private static final int EVENT_POLL_TCPINFO = 21;
     // Start mReevaluateDelayMs at this value and double.
     private static final int INITIAL_REEVALUATE_DELAY_MS = 1000;
     private static final int MAX_REEVALUATE_DELAY_MS = 10 * 60 * 1000;
@@ -300,7 +309,7 @@ public class NetworkMonitor extends StateMachine {
     private final IpConnectivityLog mMetricsLog;
     private final Dependencies mDependencies;
     private final DataStallStatsUtils mDetectionStatsUtils;
-
+    private final TcpSocketTracker mTcpTracker;
     // Configuration values for captive portal detection probes.
     private final String mCaptivePortalUserAgent;
     private final URL mCaptivePortalHttpsUrl;
@@ -381,13 +390,15 @@ public class NetworkMonitor extends StateMachine {
     public NetworkMonitor(Context context, INetworkMonitorCallbacks cb, Network network,
             SharedLog validationLog) {
         this(context, cb, network, new IpConnectivityLog(), validationLog,
-                Dependencies.DEFAULT, new DataStallStatsUtils());
+                Dependencies.DEFAULT, new DataStallStatsUtils(), new TcpSocketTracker(
+                        new TcpSocketTracker.Dependencies(context,
+                        ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q))));
     }
 
     @VisibleForTesting
     public NetworkMonitor(Context context, INetworkMonitorCallbacks cb, Network network,
             IpConnectivityLog logger, SharedLog validationLogs,
-            Dependencies deps, DataStallStatsUtils detectionStatsUtils) {
+            Dependencies deps, DataStallStatsUtils detectionStatsUtils, TcpSocketTracker tst) {
         // Add suffix indicating which NetworkMonitor we're talking about.
         super(TAG + "/" + network.toString());
 
@@ -434,6 +445,7 @@ public class NetworkMonitor extends StateMachine {
         mDataStallMinEvaluateTime = getDataStallMinEvaluateTime();
         mDataStallValidDnsTimeThreshold = getDataStallValidDnsTimeThreshold();
         mDataStallEvaluationType = getDataStallEvaluationType();
+        mTcpTracker = tst;
 
         // Provide empty LinkProperties and NetworkCapabilities to make sure they are never null,
         // even before notifyNetworkConnected.
@@ -726,6 +738,7 @@ public class NetworkMonitor extends StateMachine {
             }
             mEvaluationState.reportEvaluationResult(result, null /* redirectUrl */);
             mValidations++;
+            sendTcpPollingEvent();
         }
 
         @Override
@@ -740,16 +753,45 @@ public class NetworkMonitor extends StateMachine {
                     break;
                 case EVENT_DNS_NOTIFICATION:
                     mDnsStallDetector.accumulateConsecutiveDnsTimeoutCount(message.arg1);
-                    if (isDataStall()) {
-                        mCollectDataStallMetrics = true;
-                        validationLog("Suspecting data stall, reevaluate");
+                    if (evaluateDataStall()) {
                         transitionTo(mEvaluatingState);
+                    }
+                    break;
+                case EVENT_POLL_TCPINFO:
+                    // Transit if retrieve socket info is succeeded and suspected as a stall.
+                    if (getTcpSocketTracker().pollSocketsInfo() && evaluateDataStall()) {
+                        transitionTo(mEvaluatingState);
+                    } else {
+                        sendTcpPollingEvent();
                     }
                     break;
                 default:
                     return NOT_HANDLED;
             }
             return HANDLED;
+        }
+
+        boolean evaluateDataStall() {
+            if (isDataStall()) {
+                // TODO: Add tcp info into metrics.
+                mCollectDataStallMetrics = true;
+                validationLog("Suspecting data stall, reevaluate");
+                return true;
+            }
+            return false;
+        }
+
+        @Override
+        public void exit() {
+            // Not useful for non-ValidatedState.
+            removeMessages(EVENT_POLL_TCPINFO);
+        }
+    }
+
+    @VisibleForTesting
+    void sendTcpPollingEvent() {
+        if (isValidationRequired()) {
+            sendMessageDelayed(EVENT_POLL_TCPINFO, getTcpPollingInterval());
         }
     }
 
@@ -1339,6 +1381,12 @@ public class NetworkMonitor extends StateMachine {
         return mDependencies.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
                 CONFIG_DATA_STALL_EVALUATION_TYPE,
                 DEFAULT_DATA_STALL_EVALUATION_TYPES);
+    }
+
+    private int getTcpPollingInterval() {
+        return mDependencies.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY,
+                CONFIG_DATA_STALL_TCP_POLLING_INTERVAL,
+                DEFAULT_TCP_POLLING_INTERVAL_MS);
     }
 
     private URL[] makeCaptivePortalFallbackUrls() {
@@ -2060,10 +2108,14 @@ public class NetworkMonitor extends StateMachine {
         }
     }
 
-
     @VisibleForTesting
     protected DnsStallDetector getDnsStallDetector() {
         return mDnsStallDetector;
+    }
+
+    @VisibleForTesting
+    protected TcpSocketTracker getTcpSocketTracker() {
+        return mTcpTracker;
     }
 
     private boolean dataStallEvaluateTypeEnabled(int type) {
@@ -2077,7 +2129,7 @@ public class NetworkMonitor extends StateMachine {
 
     @VisibleForTesting
     protected boolean isDataStall() {
-        boolean result = false;
+        Boolean result = null;
         // Reevaluation will generate traffic. Thus, set a minimal reevaluation timer to limit the
         // possible traffic cost in metered network.
         if (!mNetworkCapabilities.hasCapability(NET_CAPABILITY_NOT_METERED)
@@ -2085,11 +2137,22 @@ public class NetworkMonitor extends StateMachine {
                 < mDataStallMinEvaluateTime)) {
             return false;
         }
+        // Check TCP signal. Suspect it may be a data stall if :
+        // 1. TCP connection fail rate(lost+retrans) is higher than threshold.
+        // 2. Accumulate enough packets count.
+        // TODO: Need to filter per target network.
+        if (dataStallEvaluateTypeEnabled(DATA_STALL_EVALUATION_TYPE_TCP)) {
+            if (getTcpSocketTracker().getLatestReceivedCount() > 0) {
+                result = false;
+            } else if (getTcpSocketTracker().isDataStallSuspected()) {
+                result = true;
+            }
+        }
 
         // Check dns signal. Suspect it may be a data stall if both :
         // 1. The number of consecutive DNS query timeouts >= mConsecutiveDnsTimeoutThreshold.
         // 2. Those consecutive DNS queries happened in the last mValidDataStallDnsTimeThreshold ms.
-        if (dataStallEvaluateTypeEnabled(DATA_STALL_EVALUATION_TYPE_DNS)) {
+        if ((result == null) && dataStallEvaluateTypeEnabled(DATA_STALL_EVALUATION_TYPE_DNS)) {
             if (mDnsStallDetector.isDataStallSuspected(mConsecutiveDnsTimeoutThreshold,
                     mDataStallValidDnsTimeThreshold)) {
                 result = true;
@@ -2099,10 +2162,12 @@ public class NetworkMonitor extends StateMachine {
 
         if (VDBG_STALL) {
             log("isDataStall: result=" + result + ", consecutive dns timeout count="
-                    + mDnsStallDetector.getConsecutiveTimeoutCount());
+                    + mDnsStallDetector.getConsecutiveTimeoutCount()
+                    + ", tcp packets received=" + getTcpSocketTracker().getLatestReceivedCount()
+                    + ", tcp fail rate=" + getTcpSocketTracker().getLatestPacketFailPercentage());
         }
 
-        return result;
+        return (result == null) ? false : result;
     }
 
     // Class to keep state of evaluation results and probe results.
