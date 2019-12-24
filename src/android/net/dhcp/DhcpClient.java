@@ -240,6 +240,7 @@ public class DhcpClient extends StateMachine {
     private Inet4Address mLastAssignedIpv4Address;
     private long mLastAssignedIpv4AddressExpiry;
     private boolean mDhcpLeaseCacheEnabled;
+    private Dependencies mDependencies;
     @NonNull
     private final NetworkStackIpMemoryStore mIpMemoryStore;
 
@@ -271,15 +272,43 @@ public class DhcpClient extends StateMachine {
         return new WakeupMessage(mContext, getHandler(), cmdName, cmd);
     }
 
+    /**
+     * Encapsulates DhcpClient depencencies that's used for unit testing and
+     * integration testing.
+     */
+    public static class Dependencies {
+        private final NetworkStackIpMemoryStore mNetworkStackIpMemoryStore;
+
+        public Dependencies(NetworkStackIpMemoryStore store) {
+            mNetworkStackIpMemoryStore = store;
+        }
+
+        /**
+         * Get a IpMemoryStore instance.
+         */
+        public NetworkStackIpMemoryStore getIpMemoryStore() {
+            return mNetworkStackIpMemoryStore;
+        }
+
+        /**
+         * Get the value of DHCP related experiment flags.
+         */
+        public boolean getBooleanDeviceConfig(final String nameSpace, final String flagName) {
+            return NetworkStackUtils.getDeviceConfigPropertyBoolean(nameSpace, flagName,
+                    false /* default value */);
+        }
+    }
+
     // TODO: Take an InterfaceParams instance instead of an interface name String.
     private DhcpClient(Context context, StateMachine controller, String iface,
-            NetworkStackIpMemoryStore ipMemoryStore) {
+            Dependencies deps) {
         super(TAG, controller.getHandler());
 
+        mDependencies = deps;
         mContext = context;
         mController = controller;
         mIfaceName = iface;
-        mIpMemoryStore = ipMemoryStore;
+        mIpMemoryStore = deps.getIpMemoryStore();
 
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
@@ -320,8 +349,8 @@ public class DhcpClient extends StateMachine {
 
     public static DhcpClient makeDhcpClient(
             Context context, StateMachine controller, InterfaceParams ifParams,
-            NetworkStackIpMemoryStore ipMemoryStore) {
-        DhcpClient client = new DhcpClient(context, controller, ifParams.name, ipMemoryStore);
+            Dependencies deps) {
+        DhcpClient client = new DhcpClient(context, controller, ifParams.name, deps);
         client.mIface = ifParams;
         client.start();
         return client;
@@ -329,7 +358,6 @@ public class DhcpClient extends StateMachine {
 
     /**
      * check whether or not to support caching the last lease info and INIT-REBOOT state.
-     *
      */
     public boolean isDhcpLeaseCacheEnabled() {
         mDhcpLeaseCacheEnabled = Boolean.parseBoolean(NetworkStackUtils.getDeviceConfigProperty(
@@ -340,11 +368,23 @@ public class DhcpClient extends StateMachine {
 
     /**
      * set DHCP lease cached enabled experiment flag.
-     *
      */
     @VisibleForTesting
     public void setDhcpLeaseCacheEnabled(final boolean enabled) {
         mDhcpLeaseCacheEnabled = enabled;
+    }
+
+    /**
+     * check whether or not to support DHCP Rapid Commit option.
+     */
+    public boolean isDhcpRapidCommitEnabled() {
+        return mDependencies.getBooleanDeviceConfig(NetworkStackUtils.NAMESPACE_CONNECTIVITY,
+                NetworkStackUtils.DHCP_RAPID_COMMIT_ENABLED);
+    }
+
+    private void confirmDhcpLease(DhcpPacket packet, DhcpResults results) {
+        setDhcpLeaseExpiry(packet);
+        acceptDhcpResults(results, "Confirmed");
     }
 
     private boolean initInterface() {
@@ -495,7 +535,7 @@ public class DhcpClient extends StateMachine {
     private boolean sendDiscoverPacket() {
         ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                 DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
-                DO_UNICAST, REQUESTED_PARAMS);
+                DO_UNICAST, REQUESTED_PARAMS, isDhcpRapidCommitEnabled());
         return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
 
@@ -982,11 +1022,26 @@ public class DhcpClient extends StateMachine {
 
         protected void receivePacket(DhcpPacket packet) {
             if (!isValidPacket(packet)) return;
-            if (!(packet instanceof DhcpOfferPacket)) return;
-            mOffer = packet.toDhcpResults();
-            if (mOffer != null) {
-                Log.d(TAG, "Got pending lease: " + mOffer);
-                transitionTo(mDhcpRequestingState);
+
+            // 1. received the DHCPOFFER packet, process it by following RFC2131.
+            // 2. received the DHCPACK packet from DHCP Servers who support Rapid
+            //    Commit option, process it by following RFC4039.
+            if (packet instanceof DhcpOfferPacket) {
+                mOffer = packet.toDhcpResults();
+                if (mOffer != null) {
+                    Log.d(TAG, "Got pending lease: " + mOffer);
+                    transitionTo(mDhcpRequestingState);
+                }
+            } else if (packet instanceof DhcpAckPacket) {
+                // If received DHCPACK packet w/o Rapid Commit option in this state,
+                // just drop it and wait for the next DHCPOFFER packet or DHCPACK w/
+                // Rapid Commit option.
+                if (!isDhcpRapidCommitEnabled() || !packet.mRapidCommit) return;
+                final DhcpResults results = packet.toDhcpResults();
+                if (results != null) {
+                    confirmDhcpLease(packet, results);
+                    transitionTo(mConfiguringInterfaceState);
+                }
             }
         }
     }
@@ -1013,8 +1068,7 @@ public class DhcpClient extends StateMachine {
             if ((packet instanceof DhcpAckPacket)) {
                 DhcpResults results = packet.toDhcpResults();
                 if (results != null) {
-                    setDhcpLeaseExpiry(packet);
-                    acceptDhcpResults(results, "Confirmed");
+                    confirmDhcpLease(packet, results);
                     transitionTo(mConfiguringInterfaceState);
                 }
             } else if (packet instanceof DhcpNakPacket) {
