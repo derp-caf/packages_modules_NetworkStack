@@ -304,7 +304,7 @@ public class IpClient extends StateMachine {
     // Internal commands to use instead of trying to call transitionTo() inside
     // a given State's enter() method. Calling transitionTo() from enter/exit
     // encounters a Log.wtf() that can cause trouble on eng builds.
-    private static final int CMD_JUMP_STARTED_TO_RUNNING          = 100;
+    private static final int CMD_ADDRESSES_CLEARED                = 100;
     private static final int CMD_JUMP_RUNNING_TO_STOPPING         = 101;
     private static final int CMD_JUMP_STOPPING_TO_STOPPED         = 102;
 
@@ -330,6 +330,7 @@ public class IpClient extends StateMachine {
 
     private final State mStoppedState = new StoppedState();
     private final State mStoppingState = new StoppingState();
+    private final State mClearingIpAddressesState = new ClearingIpAddressesState();
     private final State mStartedState = new StartedState();
     private final State mRunningState = new RunningState();
 
@@ -584,6 +585,7 @@ public class IpClient extends StateMachine {
         // CHECKSTYLE:OFF IndentationCheck
         addState(mStoppedState);
         addState(mStartedState);
+            addState(mClearingIpAddressesState, mStartedState);
             addState(mRunningState, mStartedState);
         addState(mStoppingState);
         // CHECKSTYLE:ON IndentationCheck
@@ -1294,7 +1296,7 @@ public class IpClient extends StateMachine {
 
                 case CMD_START:
                     mConfiguration = (android.net.shared.ProvisioningConfiguration) msg.obj;
-                    transitionTo(mStartedState);
+                    transitionTo(mClearingIpAddressesState);
                     break;
 
                 case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
@@ -1373,23 +1375,63 @@ public class IpClient extends StateMachine {
         }
     }
 
-    class StartedState extends State {
+    class ClearingIpAddressesState extends State {
         @Override
         public void enter() {
-            mStartTimeMillis = SystemClock.elapsedRealtime();
-            if (mConfiguration.mProvisioningTimeoutMs > 0) {
-                final long alarmTime = SystemClock.elapsedRealtime()
-                        + mConfiguration.mProvisioningTimeoutMs;
-                mProvisioningTimeoutAlarm.schedule(alarmTime);
-            }
-
             if (readyToProceed()) {
-                deferMessage(obtainMessage(CMD_JUMP_STARTED_TO_RUNNING));
+                deferMessage(obtainMessage(CMD_ADDRESSES_CLEARED));
             } else {
                 // Clear all IPv4 and IPv6 before proceeding to RunningState.
                 // Clean up any leftover state from an abnormal exit from
                 // tethering or during an IpClient restart.
                 stopAllIP();
+            }
+        }
+
+        @Override
+        public boolean processMessage(Message msg) {
+            switch (msg.what) {
+                case CMD_ADDRESSES_CLEARED:
+                    transitionTo(mRunningState);
+                    break;
+
+                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
+                    handleLinkPropertiesUpdate(NO_CALLBACKS);
+                    if (readyToProceed()) {
+                        transitionTo(mRunningState);
+                    }
+                    break;
+
+                case CMD_STOP:
+                case EVENT_PROVISIONING_TIMEOUT:
+                    // Fall through to StartedState.
+                    return NOT_HANDLED;
+
+                default:
+                    // It's safe to process messages out of order because the
+                    // only message that can both
+                    //     a) be received at this time and
+                    //     b) affect provisioning state
+                    // is EVENT_NETLINK_LINKPROPERTIES_CHANGED (handled above).
+                    deferMessage(msg);
+            }
+            return HANDLED;
+        }
+
+        private boolean readyToProceed() {
+            return (!mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address());
+        }
+    }
+
+    class StartedState extends State {
+        @Override
+        public void enter() {
+            mStartTimeMillis = SystemClock.elapsedRealtime();
+
+            if (mConfiguration.mProvisioningTimeoutMs > 0) {
+                final long alarmTime = SystemClock.elapsedRealtime()
+                        + mConfiguration.mProvisioningTimeoutMs;
+                mProvisioningTimeoutAlarm.schedule(alarmTime);
             }
         }
 
@@ -1401,19 +1443,8 @@ public class IpClient extends StateMachine {
         @Override
         public boolean processMessage(Message msg) {
             switch (msg.what) {
-                case CMD_JUMP_STARTED_TO_RUNNING:
-                    transitionTo(mRunningState);
-                    break;
-
                 case CMD_STOP:
                     transitionTo(mStoppingState);
-                    break;
-
-                case EVENT_NETLINK_LINKPROPERTIES_CHANGED:
-                    handleLinkPropertiesUpdate(NO_CALLBACKS);
-                    if (readyToProceed()) {
-                        transitionTo(mRunningState);
-                    }
                     break;
 
                 case CMD_UPDATE_L2KEY_GROUPHINT: {
@@ -1434,20 +1465,11 @@ public class IpClient extends StateMachine {
                     handleProvisioningFailure();
                     break;
                 default:
-                    // It's safe to process messages out of order because the
-                    // only message that can both
-                    //     a) be received at this time and
-                    //     b) affect provisioning state
-                    // is EVENT_NETLINK_LINKPROPERTIES_CHANGED (handled above).
-                    deferMessage(msg);
+                    return NOT_HANDLED;
             }
 
             mMsgStateLogger.handled(this, getCurrentState());
             return HANDLED;
-        }
-
-        private boolean readyToProceed() {
-            return (!mLinkProperties.hasIpv4Address() && !mLinkProperties.hasGlobalIpv6Address());
         }
     }
 
