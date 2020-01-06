@@ -83,9 +83,10 @@ java_defaults {
         ":framework-networkstack-shared-srcs",
         ":statslog-networkstack-java-gen",
     ],
+    libs: ["unsupportedappusage"],
     static_libs: [
         "androidx.annotation_annotation",
-        "netd_aidl_interface-V2-java",
+        "netd_aidl_interface-unstable-java",
         "netlink-client",
         "networkstack-client",
         "datastallprotosnano",
