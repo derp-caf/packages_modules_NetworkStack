@@ -29,11 +29,15 @@ import static android.net.dhcp.DhcpPacket.DHCP_VENDOR_INFO;
 import static android.net.dhcp.DhcpPacket.INADDR_ANY;
 import static android.net.dhcp.DhcpPacket.INADDR_BROADCAST;
 import static android.net.dhcp.DhcpPacket.INFINITE_LEASE;
+import static android.net.util.NetworkStackUtils.DHCP_INIT_REBOOT_VERSION;
+import static android.net.util.NetworkStackUtils.DHCP_IP_CONFLICT_DETECT_VERSION;
+import static android.net.util.NetworkStackUtils.DHCP_RAPID_COMMIT_VERSION;
 import static android.net.util.NetworkStackUtils.closeSocketQuietly;
 import static android.net.util.SocketUtils.makePacketSocketAddress;
 import static android.provider.DeviceConfig.NAMESPACE_CONNECTIVITY;
 import static android.system.OsConstants.AF_INET;
 import static android.system.OsConstants.AF_PACKET;
+import static android.system.OsConstants.ETH_P_ARP;
 import static android.system.OsConstants.ETH_P_IP;
 import static android.system.OsConstants.IPPROTO_UDP;
 import static android.system.OsConstants.SOCK_DGRAM;
@@ -44,11 +48,17 @@ import static android.system.OsConstants.SO_BROADCAST;
 import static android.system.OsConstants.SO_RCVBUF;
 import static android.system.OsConstants.SO_REUSEADDR;
 
+import static com.android.server.util.NetworkStackConstants.ARP_REQUEST;
+import static com.android.server.util.NetworkStackConstants.ETHER_ADDR_LEN;
 import static com.android.server.util.NetworkStackConstants.IPV4_ADDR_ANY;
+import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_ANNOUNCE_NUM;
+import static com.android.server.util.NetworkStackConstants.IPV4_CONFLICT_PROBE_NUM;
 
 import android.content.Context;
 import android.net.DhcpResults;
 import android.net.InetAddresses;
+import android.net.Layer2PacketParcelable;
+import android.net.MacAddress;
 import android.net.NetworkStackIpMemoryStore;
 import android.net.TrafficStats;
 import android.net.ip.IpClient;
@@ -64,6 +74,7 @@ import android.net.util.PacketReader;
 import android.net.util.SocketUtils;
 import android.os.Handler;
 import android.os.Message;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -83,6 +94,7 @@ import com.android.internal.util.TrafficStatsConstants;
 import com.android.internal.util.WakeupMessage;
 import com.android.networkstack.R;
 import com.android.networkstack.apishim.SocketUtilsShimImpl;
+import com.android.networkstack.arp.ArpPacket;
 
 import java.io.FileDescriptor;
 import java.io.IOException;
@@ -120,6 +132,7 @@ public class DhcpClient extends StateMachine {
 
     private static final String TAG = "DhcpClient";
     private static final boolean DBG = true;
+    private static final boolean VDBG = Log.isLoggable(TAG, Log.VERBOSE);
     private static final boolean STATE_DBG = Log.isLoggable(TAG, Log.DEBUG);
     private static final boolean MSG_DBG = Log.isLoggable(TAG, Log.DEBUG);
     private static final boolean PACKET_DBG = Log.isLoggable(TAG, Log.DEBUG);
@@ -135,6 +148,43 @@ public class DhcpClient extends StateMachine {
     private static final int FIRST_TIMEOUT_MS         =   2 * SECONDS;
     private static final int MAX_TIMEOUT_MS           = 128 * SECONDS;
     private static final int IPMEMORYSTORE_TIMEOUT_MS =   1 * SECONDS;
+
+    // The waiting time to restart the DHCP configuration process after broadcasting a
+    // DHCPDECLINE message, (RFC2131 3.1.5 describes client SHOULD wait a minimum of 10
+    // seconds to avoid excessive traffic, but it's too long).
+    @VisibleForTesting
+    public static final String DHCP_RESTART_CONFIG_DELAY = "dhcp_restart_configuration_delay";
+    private static final int DEFAULT_DHCP_RESTART_CONFIG_DELAY_SEC = 1 * SECONDS;
+
+    // Initial random delay before sending first ARP probe.
+    @VisibleForTesting
+    public static final String ARP_FIRST_PROBE_DELAY_MS = "arp_first_probe_delay";
+    private static final int DEFAULT_ARP_FIRST_PROBE_DELAY_MS = 100;
+
+    // Minimum delay until retransmitting the probe. The probe will be retransmitted after a
+    // random number of milliseconds in the range ARP_PROBE_MIN_MS and ARP_PROBE_MAX_MS.
+    @VisibleForTesting
+    public static final String ARP_PROBE_MIN_MS = "arp_probe_min";
+    private static final int DEFAULT_ARP_PROBE_MIN_MS = 100;
+
+    // Maximum delay until retransmitting the probe.
+    @VisibleForTesting
+    public static final String ARP_PROBE_MAX_MS = "arp_probe_max";
+    private static final int DEFAULT_ARP_PROBE_MAX_MS = 300;
+
+    // Initial random delay before sending first ARP Announcement after completing Probe packet
+    // transmission.
+    @VisibleForTesting
+    public static final String ARP_FIRST_ANNOUNCE_DELAY_MS = "arp_first_announce_delay";
+    private static final int DEFAULT_ARP_FIRST_ANNOUNCE_DELAY_MS = 100;
+
+    // Time between retransmitting ARP Announcement packets.
+    @VisibleForTesting
+    public static final String ARP_ANNOUNCE_INTERVAL_MS = "arp_announce_interval";
+    private static final int DEFAULT_ARP_ANNOUNCE_INTERVAL_MS = 100;
+
+    // Max conflict count before configuring interface with declined IP address anyway.
+    private static final int MAX_CONFLICTS_COUNT = 2;
 
     // This is not strictly needed, since the client is asynchronous and implements exponential
     // backoff. It's maintained for backwards compatibility with the previous DHCP code, which was
@@ -169,6 +219,10 @@ public class DhcpClient extends StateMachine {
     public static final int CMD_CONFIGURE_LINKADDRESS       = PUBLIC_BASE + 8;
     public static final int EVENT_LINKADDRESS_CONFIGURED    = PUBLIC_BASE + 9;
 
+    // Command to IpClient starting/aborting preconnection process.
+    public static final int CMD_START_PRECONNECTION         = PUBLIC_BASE + 10;
+    public static final int CMD_ABORT_PRECONNECTION         = PUBLIC_BASE + 11;
+
     /* Message.arg1 arguments to CMD_POST_DHCP_ACTION notification */
     public static final int DHCP_SUCCESS = 1;
     public static final int DHCP_FAILURE = 2;
@@ -184,6 +238,9 @@ public class DhcpClient extends StateMachine {
     private static final int EVENT_CONFIGURATION_TIMEOUT   = PRIVATE_BASE + 7;
     private static final int EVENT_CONFIGURATION_OBTAINED  = PRIVATE_BASE + 8;
     private static final int EVENT_CONFIGURATION_INVALID   = PRIVATE_BASE + 9;
+    private static final int EVENT_IP_CONFLICT             = PRIVATE_BASE + 10;
+    private static final int CMD_ARP_PROBE        = PRIVATE_BASE + 11;
+    private static final int CMD_ARP_ANNOUNCEMENT = PRIVATE_BASE + 12;
 
     // constant to represent this DHCP lease has been expired.
     @VisibleForTesting
@@ -239,8 +296,9 @@ public class DhcpClient extends StateMachine {
     private DhcpResults mDhcpLease;
     private long mDhcpLeaseExpiry;
     private DhcpResults mOffer;
-    private String mL2Key;
+    private Configuration mConfiguration;
     private Inet4Address mLastAssignedIpv4Address;
+    private int mConflictCount;
     private long mLastAssignedIpv4AddressExpiry;
     private Dependencies mDependencies;
     @NonNull
@@ -256,6 +314,7 @@ public class DhcpClient extends StateMachine {
     private State mStoppedState = new StoppedState();
     private State mDhcpState = new DhcpState();
     private State mDhcpInitState = new DhcpInitState();
+    private State mDhcpPreconnectingState = new DhcpPreconnectingState();
     private State mDhcpSelectingState = new DhcpSelectingState();
     private State mDhcpRequestingState = new DhcpRequestingState();
     private State mDhcpHaveLeaseState = new DhcpHaveLeaseState();
@@ -270,6 +329,8 @@ public class DhcpClient extends StateMachine {
     private State mWaitBeforeRenewalState = new WaitBeforeRenewalState(mDhcpRenewingState);
     private State mWaitBeforeObtainingConfigurationState =
             new WaitBeforeObtainingConfigurationState(mObtainingConfigurationState);
+    private State mIpAddressConflictDetectingState = new IpAddressConflictDetectingState();
+    private State mDhcpDecliningState = new DhcpDecliningState();
 
     private WakeupMessage makeWakeupMessage(String cmdName, int cmd) {
         cmdName = DhcpClient.class.getSimpleName() + "." + mIfaceName + "." + cmdName;
@@ -295,11 +356,51 @@ public class DhcpClient extends StateMachine {
         }
 
         /**
-         * Get the value of DHCP related experiment flags.
+         * Return whether a feature guarded by a feature flag is enabled.
+         * @see NetworkStackUtils#isFeatureEnabled(Context, String, String)
          */
-        public boolean getBooleanDeviceConfig(final String nameSpace, final String flagName) {
-            return NetworkStackUtils.getDeviceConfigPropertyBoolean(nameSpace, flagName,
-                    false /* default value */);
+        public boolean isFeatureEnabled(final Context context, final String name) {
+            return NetworkStackUtils.isFeatureEnabled(context, NAMESPACE_CONNECTIVITY, name);
+        }
+
+        /**
+         * Get the Integer value of relevant DeviceConfig properties of Connectivity namespace.
+         */
+        public int getIntDeviceConfig(final String name) {
+            final int defaultValue;
+            switch (name) {
+                case DHCP_RESTART_CONFIG_DELAY:
+                    defaultValue = DEFAULT_DHCP_RESTART_CONFIG_DELAY_SEC;
+                    break;
+                case ARP_FIRST_PROBE_DELAY_MS:
+                    defaultValue = DEFAULT_ARP_FIRST_PROBE_DELAY_MS;
+                    break;
+                case ARP_PROBE_MIN_MS:
+                    defaultValue = DEFAULT_ARP_PROBE_MIN_MS;
+                    break;
+                case ARP_PROBE_MAX_MS:
+                    defaultValue = DEFAULT_ARP_PROBE_MAX_MS;
+                    break;
+                case ARP_FIRST_ANNOUNCE_DELAY_MS:
+                    defaultValue = DEFAULT_ARP_FIRST_ANNOUNCE_DELAY_MS;
+                    break;
+                case ARP_ANNOUNCE_INTERVAL_MS:
+                    defaultValue = DEFAULT_ARP_ANNOUNCE_INTERVAL_MS;
+                    break;
+                default:
+                    Log.e(TAG, "Invalid experiment flag: " + name);
+                    return 0;
+            }
+            return NetworkStackUtils.getDeviceConfigPropertyInt(NAMESPACE_CONNECTIVITY, name,
+                    defaultValue);
+        }
+
+        /**
+         * Get a new wake lock to force CPU keeping awake when transmitting packets or waiting
+         * for timeout.
+         */
+        public PowerManager.WakeLock getWakeLock(final PowerManager powerManager) {
+            return powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
         }
     }
 
@@ -320,15 +421,18 @@ public class DhcpClient extends StateMachine {
             addState(mDhcpInitState, mDhcpState);
             addState(mWaitBeforeStartState, mDhcpState);
             addState(mWaitBeforeObtainingConfigurationState, mDhcpState);
+            addState(mDhcpPreconnectingState, mDhcpState);
             addState(mObtainingConfigurationState, mDhcpState);
             addState(mDhcpSelectingState, mDhcpState);
             addState(mDhcpRequestingState, mDhcpState);
+            addState(mIpAddressConflictDetectingState, mDhcpState);
             addState(mDhcpHaveLeaseState, mDhcpState);
                 addState(mConfiguringInterfaceState, mDhcpHaveLeaseState);
                 addState(mDhcpBoundState, mDhcpHaveLeaseState);
                 addState(mWaitBeforeRenewalState, mDhcpHaveLeaseState);
                 addState(mDhcpRenewingState, mDhcpHaveLeaseState);
                 addState(mDhcpRebindingState, mDhcpHaveLeaseState);
+                addState(mDhcpDecliningState, mDhcpHaveLeaseState);
             addState(mDhcpInitRebootState, mDhcpState);
             addState(mDhcpRebootingState, mDhcpState);
         // CHECKSTYLE:ON IndentationCheck
@@ -362,19 +466,23 @@ public class DhcpClient extends StateMachine {
 
     /**
      * check whether or not to support caching the last lease info and INIT-REBOOT state.
-     *
      */
     public boolean isDhcpLeaseCacheEnabled() {
-        return mDependencies.getBooleanDeviceConfig(NAMESPACE_CONNECTIVITY,
-                NetworkStackUtils.DHCP_INIT_REBOOT_ENABLED);
+        return mDependencies.isFeatureEnabled(mContext, DHCP_INIT_REBOOT_VERSION);
     }
 
     /**
      * check whether or not to support DHCP Rapid Commit option.
      */
     public boolean isDhcpRapidCommitEnabled() {
-        return mDependencies.getBooleanDeviceConfig(NAMESPACE_CONNECTIVITY,
-                NetworkStackUtils.DHCP_RAPID_COMMIT_ENABLED);
+        return mDependencies.isFeatureEnabled(mContext, DHCP_RAPID_COMMIT_VERSION);
+    }
+
+    /**
+     * check whether or not to support IP address conflict detection and DHCPDECLINE.
+     */
+    public boolean isDhcpIpConflictDetectEnabled() {
+        return mDependencies.isFeatureEnabled(mContext, DHCP_IP_CONFLICT_DETECT_VERSION);
     }
 
     private void confirmDhcpLease(DhcpPacket packet, DhcpResults results) {
@@ -492,7 +600,8 @@ public class DhcpClient extends StateMachine {
 
         public int transmitPacket(final ByteBuffer buf, final SocketAddress socketAddress)
                 throws ErrnoException, SocketException {
-            return Os.sendto(mPacketSock, buf.array(), 0, buf.limit(), 0, socketAddress);
+            return Os.sendto(mPacketSock, buf.array(), 0 /* byteOffset */,
+                    buf.limit() /* byteCount */, 0 /* flags */, socketAddress);
         }
     }
 
@@ -529,20 +638,20 @@ public class DhcpClient extends StateMachine {
     }
 
     private boolean sendDiscoverPacket() {
-        ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
+        final ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
                 DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
                 DO_UNICAST, REQUESTED_PARAMS, isDhcpRapidCommitEnabled());
         return transmitPacket(packet, "DHCPDISCOVER", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
 
     private boolean sendRequestPacket(
-            Inet4Address clientAddress, Inet4Address requestedAddress,
-            Inet4Address serverAddress, Inet4Address to) {
+            final Inet4Address clientAddress, final Inet4Address requestedAddress,
+            final Inet4Address serverAddress, final Inet4Address to) {
         // TODO: should we use the transaction ID from the server?
         final int encap = INADDR_ANY.equals(clientAddress)
                 ? DhcpPacket.ENCAP_L2 : DhcpPacket.ENCAP_BOOTP;
 
-        ByteBuffer packet = DhcpPacket.buildRequestPacket(
+        final ByteBuffer packet = DhcpPacket.buildRequestPacket(
                 encap, mTransactionId, getSecs(), clientAddress,
                 DO_UNICAST, mHwAddr, requestedAddress,
                 serverAddress, REQUESTED_PARAMS, null);
@@ -551,6 +660,14 @@ public class DhcpClient extends StateMachine {
                              " request=" + requestedAddress.getHostAddress() +
                              " serverid=" + serverStr;
         return transmitPacket(packet, description, encap, to);
+    }
+
+    private boolean sendDeclinePacket(final Inet4Address requestedAddress,
+            final Inet4Address serverIdentifier) {
+        // Requested IP address and Server Identifier options are mandatory for DHCPDECLINE.
+        final ByteBuffer packet = DhcpPacket.buildDeclinePacket(DhcpPacket.ENCAP_L2,
+                mTransactionId, mHwAddr, requestedAddress, serverIdentifier);
+        return transmitPacket(packet, "DHCPDECLINE", DhcpPacket.ENCAP_L2, INADDR_BROADCAST);
     }
 
     private void scheduleLeaseTimers() {
@@ -578,7 +695,7 @@ public class DhcpClient extends StateMachine {
     }
 
     private void setLeaseExpiredToIpMemoryStore() {
-        final String l2Key = mL2Key;
+        final String l2Key = mConfiguration.l2Key;
         if (l2Key == null) return;
         final NetworkAttributes.Builder na = new NetworkAttributes.Builder();
         // TODO: clear out the address and lease instead of storing an expired lease
@@ -591,7 +708,7 @@ public class DhcpClient extends StateMachine {
     }
 
     private void maybeSaveLeaseToIpMemoryStore() {
-        final String l2Key = mL2Key;
+        final String l2Key = mConfiguration.l2Key;
         if (l2Key == null || mDhcpLease == null || mDhcpLease.ipAddress == null) return;
         final NetworkAttributes.Builder na = new NetworkAttributes.Builder();
         na.setAssignedV4Address((Inet4Address) mDhcpLease.ipAddress.getAddress());
@@ -711,7 +828,11 @@ public class DhcpClient extends StateMachine {
     // Sends CMD_PRE_DHCP_ACTION to the controller, waits for the controller to respond with
     // CMD_PRE_DHCP_ACTION_COMPLETE, and then transitions to mOtherState.
     abstract class WaitBeforeOtherState extends LoggingState {
-        protected State mOtherState;
+        private final State mOtherState;
+
+        WaitBeforeOtherState(State otherState) {
+            mOtherState = otherState;
+        }
 
         @Override
         public void enter() {
@@ -732,18 +853,46 @@ public class DhcpClient extends StateMachine {
         }
     }
 
+    /**
+     * Helper method to transition to the appropriate state according to whether the pre dhcp
+     * action (e.g. turn off power optimization while doing DHCP) is required to execute.
+     * waitStateForPreDhcpAction is used to wait the pre dhcp action completed before moving to
+     * other state. If the pre dhcp action is unnecessary, transition to the target state directly.
+     */
+    private void preDhcpTransitionTo(final State waitStateForPreDhcpAction,
+            final State targetState) {
+        transitionTo(mRegisteredForPreDhcpNotification ? waitStateForPreDhcpAction : targetState);
+    }
+
+    /**
+     * This class is used to convey initial configuration to DhcpClient when starting DHCP.
+     */
+    public static class Configuration {
+        // This is part of the initial configuration because it is passed in on startup and
+        // never updated.
+        // TODO: decide what to do about L2 key changes while the client is connected.
+        public final String l2Key;
+        public final boolean isPreconnectionEnabled;
+
+        public Configuration(String l2Key, boolean isPreconnectionEnabled) {
+            this.l2Key = l2Key;
+            this.isPreconnectionEnabled = isPreconnectionEnabled;
+        }
+    }
+
     class StoppedState extends State {
         @Override
         public boolean processMessage(Message message) {
             switch (message.what) {
                 case CMD_START_DHCP:
-                    mL2Key = (String) message.obj;
-                    if (mRegisteredForPreDhcpNotification) {
-                        transitionTo(isDhcpLeaseCacheEnabled()
-                                ? mWaitBeforeObtainingConfigurationState : mWaitBeforeStartState);
+                    mConfiguration = (Configuration) message.obj;
+                    if (mConfiguration.isPreconnectionEnabled) {
+                        transitionTo(mDhcpPreconnectingState);
+                    } else if (isDhcpLeaseCacheEnabled()) {
+                        preDhcpTransitionTo(mWaitBeforeObtainingConfigurationState,
+                                mObtainingConfigurationState);
                     } else {
-                        transitionTo(isDhcpLeaseCacheEnabled()
-                                ? mObtainingConfigurationState : mDhcpInitState);
+                        preDhcpTransitionTo(mWaitBeforeStartState, mDhcpInitState);
                     }
                     return HANDLED;
                 default:
@@ -754,22 +903,19 @@ public class DhcpClient extends StateMachine {
 
     class WaitBeforeStartState extends WaitBeforeOtherState {
         WaitBeforeStartState(State otherState) {
-            super();
-            mOtherState = otherState;
+            super(otherState);
         }
     }
 
     class WaitBeforeRenewalState extends WaitBeforeOtherState {
         WaitBeforeRenewalState(State otherState) {
-            super();
-            mOtherState = otherState;
+            super(otherState);
         }
     }
 
     class WaitBeforeObtainingConfigurationState extends WaitBeforeOtherState {
         WaitBeforeObtainingConfigurationState(State otherState) {
-            super();
-            mOtherState = otherState;
+            super(otherState);
         }
     }
 
@@ -777,6 +923,7 @@ public class DhcpClient extends StateMachine {
         @Override
         public void enter() {
             clearDhcpState();
+            mConflictCount = 0;
             if (initInterface() && initUdpSocket()) {
                 mDhcpPacketHandler = new DhcpPacketHandler(getHandler());
                 if (mDhcpPacketHandler.start()) return;
@@ -957,7 +1104,7 @@ public class DhcpClient extends StateMachine {
                 }
                 sendMessage(EVENT_CONFIGURATION_OBTAINED, attributes);
             };
-            mIpMemoryStore.retrieveNetworkAttributes(mL2Key, listener);
+            mIpMemoryStore.retrieveNetworkAttributes(mConfiguration.l2Key, listener);
         }
 
         @Override
@@ -973,7 +1120,7 @@ public class DhcpClient extends StateMachine {
                     final long currentTime = System.currentTimeMillis();
                     NetworkAttributes attributes = (NetworkAttributes) message.obj;
                     if (DBG) {
-                        Log.d(TAG, "l2key: " + mL2Key
+                        Log.d(TAG, "l2key: "         + mConfiguration.l2Key
                                 + " lease address: " + attributes.assignedV4Address
                                 + " lease expiry: "  + attributes.assignedV4AddressExpiry
                                 + " current time: "  + currentTime);
@@ -996,9 +1143,36 @@ public class DhcpClient extends StateMachine {
 
         @Override
         public void exit() {
+            super.exit();
             removeMessages(EVENT_CONFIGURATION_INVALID);
             removeMessages(EVENT_CONFIGURATION_TIMEOUT);
             removeMessages(EVENT_CONFIGURATION_OBTAINED);
+        }
+    }
+
+    private void receiveOfferOrAckPacket(final DhcpPacket packet, final boolean acceptRapidCommit) {
+        if (!isValidPacket(packet)) return;
+
+        // 1. received the DHCPOFFER packet, process it by following RFC2131.
+        // 2. received the DHCPACK packet from DHCP Servers that support Rapid
+        //    Commit option, process it by following RFC4039.
+        if (packet instanceof DhcpOfferPacket) {
+            mOffer = packet.toDhcpResults();
+            if (mOffer != null) {
+                Log.d(TAG, "Got pending lease: " + mOffer);
+                transitionTo(mDhcpRequestingState);
+            }
+        } else if (packet instanceof DhcpAckPacket) {
+            // If rapid commit is not enabled in DhcpInitState, or enablePreconnection is
+            // not enabled in DhcpPreconnectingState, ignore DHCPACK packet. Only DHCPACK
+            // with the rapid commit option are valid.
+            if (!acceptRapidCommit || !packet.mRapidCommit) return;
+
+            final DhcpResults results = packet.toDhcpResults();
+            if (results != null) {
+                confirmDhcpLease(packet, results);
+                transitionTo(mConfiguringInterfaceState);
+            }
         }
     }
 
@@ -1019,27 +1193,86 @@ public class DhcpClient extends StateMachine {
         }
 
         protected void receivePacket(DhcpPacket packet) {
-            if (!isValidPacket(packet)) return;
+            receiveOfferOrAckPacket(packet, isDhcpRapidCommitEnabled());
+        }
+    }
 
-            // 1. received the DHCPOFFER packet, process it by following RFC2131.
-            // 2. received the DHCPACK packet from DHCP Servers who support Rapid
-            //    Commit option, process it by following RFC4039.
-            if (packet instanceof DhcpOfferPacket) {
-                mOffer = packet.toDhcpResults();
-                if (mOffer != null) {
-                    Log.d(TAG, "Got pending lease: " + mOffer);
-                    transitionTo(mDhcpRequestingState);
-                }
-            } else if (packet instanceof DhcpAckPacket) {
-                // If received DHCPACK packet w/o Rapid Commit option in this state,
-                // just drop it and wait for the next DHCPOFFER packet or DHCPACK w/
-                // Rapid Commit option.
-                if (!isDhcpRapidCommitEnabled() || !packet.mRapidCommit) return;
-                final DhcpResults results = packet.toDhcpResults();
-                if (results != null) {
-                    confirmDhcpLease(packet, results);
-                    transitionTo(mConfiguringInterfaceState);
-                }
+    private void startInitRebootOrInit() {
+        if (isDhcpLeaseCacheEnabled()) {
+            preDhcpTransitionTo(mWaitBeforeObtainingConfigurationState,
+                    mObtainingConfigurationState);
+        } else {
+            preDhcpTransitionTo(mWaitBeforeStartState, mDhcpInitState);
+        }
+    }
+
+    class DhcpPreconnectingState extends TimeoutState {
+        // This state is used to support Fast Initial Link Setup (FILS) IP Address Setup
+        // procedure defined in the IEEE802.11ai (2016) currently. However, this state could
+        // be extended to support other intended useage as well in the future, e.g. pre-actions
+        // should be completed in advance before the normal DHCP solicit process starts.
+        DhcpPreconnectingState() {
+            mTimeout = FIRST_TIMEOUT_MS;
+        }
+
+        @Override
+        public void enter() {
+            super.enter();
+            startNewTransaction();
+            mLastInitEnterTime = SystemClock.elapsedRealtime();
+            sendPreconnectionPacket();
+        }
+
+        @Override
+        public boolean processMessage(Message message) {
+            if (super.processMessage(message) == HANDLED) {
+                return HANDLED;
+            }
+
+            switch (message.what) {
+                case CMD_RECEIVED_PACKET:
+                    receiveOfferOrAckPacket((DhcpPacket) message.obj,
+                            mConfiguration.isPreconnectionEnabled);
+                    return HANDLED;
+                case CMD_ABORT_PRECONNECTION:
+                    startInitRebootOrInit();
+                    return HANDLED;
+                default:
+                    return NOT_HANDLED;
+            }
+        }
+
+        // This timeout is necessary and cannot just be replaced with a notification that
+        // preconnection is complete. This is because:
+        // - The preconnection complete notification could arrive before the ACK with rapid
+        //   commit arrives. In this case we would go back to init state, pick a new transaction
+        //   ID, and when the ACK with rapid commit arrives, we would ignore it because the
+        //   transaction ID doesn't match.
+        // - We cannot just wait in this state until the ACK with rapid commit arrives, because
+        //   if that ACK never arrives (e.g., dropped by the network), we'll never go back to init
+        //   and send a DISCOVER.
+        @Override
+        public void timeout() {
+            startInitRebootOrInit();
+        }
+
+        private void sendPreconnectionPacket() {
+            final Layer2PacketParcelable l2Packet = new Layer2PacketParcelable();
+            final ByteBuffer packet = DhcpPacket.buildDiscoverPacket(
+                    DhcpPacket.ENCAP_L2, mTransactionId, getSecs(), mHwAddr,
+                    DO_UNICAST, REQUESTED_PARAMS, true /* rapid commit */);
+
+            l2Packet.dstMacAddress = MacAddress.fromBytes(DhcpPacket.ETHER_BROADCAST);
+            l2Packet.payload = packet.array();
+            mController.sendMessage(CMD_START_PRECONNECTION, l2Packet);
+        }
+
+        private void startInitRebootOrInit() {
+            if (isDhcpLeaseCacheEnabled()) {
+                preDhcpTransitionTo(mWaitBeforeObtainingConfigurationState,
+                        mObtainingConfigurationState);
+            } else {
+                preDhcpTransitionTo(mWaitBeforeStartState, mDhcpInitState);
             }
         }
     }
@@ -1067,7 +1300,8 @@ public class DhcpClient extends StateMachine {
                 DhcpResults results = packet.toDhcpResults();
                 if (results != null) {
                     confirmDhcpLease(packet, results);
-                    transitionTo(mConfiguringInterfaceState);
+                    transitionTo(isDhcpIpConflictDetectEnabled()
+                            ? mIpAddressConflictDetectingState : mConfiguringInterfaceState);
                 }
             } else if (packet instanceof DhcpNakPacket) {
                 // TODO: Wait a while before returning into INIT state.
@@ -1132,6 +1366,238 @@ public class DhcpClient extends StateMachine {
         }
     }
 
+    private class IpConflictDetector extends PacketReader {
+        private FileDescriptor mArpSock;
+        private final Inet4Address mTargetIp;
+
+        IpConflictDetector(@NonNull Handler handler, @NonNull Inet4Address ipAddress) {
+            super(handler);
+            mTargetIp = ipAddress;
+        }
+
+        @Override
+        protected void handlePacket(byte[] recvbuf, int length) {
+            try {
+                final ArpPacket packet = ArpPacket.parseArpPacket(recvbuf, length);
+                if (hasIpAddressConflict(packet, mTargetIp)) {
+                    sendMessage(EVENT_IP_CONFLICT);
+                }
+            } catch (ArpPacket.ParseException e) {
+                logError("Can't parse ARP packet", e);
+            }
+        }
+
+        @Override
+        protected FileDescriptor createFd() {
+            try {
+                // TODO: attach ARP packet only filter.
+                mArpSock = Os.socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, 0 /* protocol */);
+                SocketAddress addr = makePacketSocketAddress(ETH_P_ARP, mIface.index);
+                Os.bind(mArpSock, addr);
+                return mArpSock;
+            } catch (SocketException | ErrnoException e) {
+                logError("Error creating ARP socket", e);
+                closeFd(mArpSock);
+                mArpSock = null;
+                return null;
+            }
+        }
+
+        @Override
+        protected void logError(@NonNull String msg, @NonNull Exception e) {
+            Log.e(TAG, msg, e);
+        }
+
+        public boolean transmitPacket(@NonNull Inet4Address targetIp,
+                @NonNull Inet4Address senderIp, final byte[] hwAddr,
+                @NonNull SocketAddress sockAddr) {
+            // RFC5227 3. describes both ARP Probes and Announcements use ARP Request packet.
+            final ByteBuffer packet = ArpPacket.buildArpPacket(DhcpPacket.ETHER_BROADCAST, hwAddr,
+                    targetIp.getAddress(), new byte[ETHER_ADDR_LEN], senderIp.getAddress(),
+                    (short) ARP_REQUEST);
+            try {
+                Os.sendto(mArpSock, packet.array(), 0 /* byteOffset */,
+                        packet.limit() /* byteCount */, 0 /* flags */, sockAddr);
+                return true;
+            } catch (ErrnoException | SocketException e) {
+                logError("Can't send ARP packet", e);
+                return false;
+            }
+        }
+    }
+
+    private boolean isArpProbe(@NonNull ArpPacket packet) {
+        return (packet.opCode == ARP_REQUEST && packet.senderIp.equals(INADDR_ANY)
+                && !packet.targetIp.equals(INADDR_ANY));
+    }
+
+    // RFC5227 2.1.1 says, during probing period:
+    // 1. the host receives any ARP packet (Request *or* Reply) on the interface where the
+    //    probe is being performed, where the packet's 'sender IP address' is the address
+    //    being probed for, then the host MUST treat this address as conflict.
+    // 2. the host receives any ARP Probe where the packet's 'target IP address' is the
+    //    address being probed for, and the packet's 'sender hardware address' is not the
+    //    hardware address of any of the host's interfaces, then the host SHOULD similarly
+    //    treat this as an address conflict.
+    private boolean checkArpSenderIpOrTargetIp(@NonNull ArpPacket packet,
+            @NonNull Inet4Address targetIp) {
+        return ((!packet.senderIp.equals(INADDR_ANY) && packet.senderIp.equals(targetIp))
+                || (isArpProbe(packet) && packet.targetIp.equals(targetIp)));
+    }
+
+    private boolean hasIpAddressConflict(@NonNull ArpPacket packet,
+            @NonNull Inet4Address targetIp) {
+        if (checkArpSenderIpOrTargetIp(packet, targetIp)
+                && !Arrays.equals(packet.senderHwAddress.toByteArray(), mHwAddr)) {
+            if (DBG) {
+                final String senderIpString = packet.senderIp.getHostAddress();
+                final String targetIpString = packet.targetIp.getHostAddress();
+                final MacAddress senderMacAddress = packet.senderHwAddress;
+                final MacAddress hostMacAddress = MacAddress.fromBytes(mHwAddr);
+                Log.d(TAG, "IP address conflict detected:"
+                        + (packet.opCode == ARP_REQUEST ? "ARP Request" : "ARP Reply")
+                        + " ARP sender MAC: " + senderMacAddress.toString()
+                        + " host MAC: "       + hostMacAddress.toString()
+                        + " ARP sender IP: "  + senderIpString
+                        + " ARP target IP: "  + targetIpString
+                        + " host target IP: " + targetIp.getHostAddress());
+            }
+            return true;
+        }
+        return false;
+    }
+
+    class IpAddressConflictDetectingState extends LoggingState {
+        private int mArpProbeCount;
+        private int mArpAnnounceCount;
+        private Inet4Address mTargetIp;
+        private IpConflictDetector mIpConflictDetector;
+        private PowerManager.WakeLock mTimeoutWakeLock;
+
+        private int mArpFirstProbeDelayMs;
+        private int mArpProbeMaxDelayMs;
+        private int mArpProbeMinDelayMs;
+        private int mArpFirstAnnounceDelayMs;
+        private int mArpAnnounceIntervalMs;
+
+        @Override
+        public void enter() {
+            super.enter();
+
+            mArpProbeCount = 0;
+            mArpAnnounceCount = 0;
+
+            // IP address conflict detection occurs after receiving DHCPACK
+            // message every time, i.e. we already get an available lease from
+            // DHCP server, that ensures mDhcpLease should be NonNull, see
+            // {@link DhcpRequestingState#receivePacket} for details.
+            mTargetIp = (Inet4Address) mDhcpLease.ipAddress.getAddress();
+            mIpConflictDetector = new IpConflictDetector(getHandler(), mTargetIp);
+
+            // IpConflictDetector might fail to create the raw socket.
+            if (!mIpConflictDetector.start()) {
+                Log.e(TAG, "Fail to start IP Conflict Detector");
+                transitionTo(mConfiguringInterfaceState);
+                return;
+            }
+
+            // Read the customized parameters from DeviceConfig.
+            mArpFirstProbeDelayMs = mDependencies.getIntDeviceConfig(ARP_FIRST_PROBE_DELAY_MS);
+            mArpProbeMaxDelayMs = mDependencies.getIntDeviceConfig(ARP_PROBE_MAX_MS);
+            mArpProbeMinDelayMs = mDependencies.getIntDeviceConfig(ARP_PROBE_MIN_MS);
+            mArpAnnounceIntervalMs = mDependencies.getIntDeviceConfig(ARP_ANNOUNCE_INTERVAL_MS);
+            mArpFirstAnnounceDelayMs = mDependencies.getIntDeviceConfig(
+                    ARP_FIRST_ANNOUNCE_DELAY_MS);
+
+            if (VDBG) {
+                Log.d(TAG, "ARP First Probe delay: "    + mArpFirstProbeDelayMs
+                        + " ARP Probe Max delay: "      + mArpProbeMaxDelayMs
+                        + " ARP Probe Min delay: "      + mArpProbeMinDelayMs
+                        + " ARP First Announce delay: " + mArpFirstAnnounceDelayMs
+                        + " ARP Announce interval: "    + mArpAnnounceIntervalMs);
+            }
+
+            // Note that when we get here, we're still processing the WakeupMessage that caused
+            // us to transition into this state, and thus the AlarmManager is still holding its
+            // wakelock. That wakelock might expire as soon as this method returns.
+            final PowerManager powerManager = mContext.getSystemService(PowerManager.class);
+            mTimeoutWakeLock = mDependencies.getWakeLock(powerManager);
+            mTimeoutWakeLock.acquire();
+
+            // RFC5227 2.1.1 describes waiting for a random time interval between 0 and
+            // PROBE_WAIT seconds before sending probe packets PROBE_NUM times, this delay
+            // helps avoid hosts send initial probe packet simultaneously upon power on.
+            // Probe packet transmission interval spaces randomly and uniformly between
+            // PROBE_MIN and PROBE_MAX.
+            sendMessageDelayed(CMD_ARP_PROBE, mRandom.nextInt(mArpFirstProbeDelayMs));
+        }
+
+        @Override
+        public boolean processMessage(Message message) {
+            super.processMessage(message);
+            switch (message.what) {
+                case CMD_ARP_PROBE:
+                    // According to RFC5227, wait ANNOUNCE_WAIT seconds after
+                    // the last ARP Probe, and no conflicting ARP Reply or ARP
+                    // Probe has been received within this period, then host can
+                    // determine the desired IP address may be used safely.
+                    sendArpProbe();
+                    if (++mArpProbeCount < IPV4_CONFLICT_PROBE_NUM) {
+                        scheduleProbe();
+                    } else {
+                        scheduleAnnounce(mArpFirstAnnounceDelayMs);
+                    }
+                    return HANDLED;
+                case CMD_ARP_ANNOUNCEMENT:
+                    sendArpAnnounce();
+                    if (++mArpAnnounceCount < IPV4_CONFLICT_ANNOUNCE_NUM) {
+                        scheduleAnnounce(mArpAnnounceIntervalMs);
+                    } else {
+                        transitionTo(mConfiguringInterfaceState);
+                    }
+                    return HANDLED;
+                case EVENT_IP_CONFLICT:
+                    transitionTo(mDhcpDecliningState);
+                    return HANDLED;
+                default:
+                    return NOT_HANDLED;
+            }
+        }
+
+        // Because the timing parameters used in IP Address detection mechanism are in
+        // milliseconds, WakeupMessage would be too imprecise for small timeouts.
+        private void scheduleProbe() {
+            long timeout = mRandom.nextInt(mArpProbeMaxDelayMs - mArpProbeMinDelayMs)
+                    + mArpProbeMinDelayMs;
+            sendMessageDelayed(CMD_ARP_PROBE, timeout);
+        }
+
+        private void scheduleAnnounce(final int timeout) {
+            sendMessageDelayed(CMD_ARP_ANNOUNCEMENT, timeout);
+        }
+
+        @Override
+        public void exit() {
+            super.exit();
+            mTimeoutWakeLock.release();
+            mIpConflictDetector.stop();
+            if (DBG) Log.d(TAG, "IP Conflict Detector stopped");
+            removeMessages(CMD_ARP_PROBE);
+            removeMessages(CMD_ARP_ANNOUNCEMENT);
+            removeMessages(EVENT_IP_CONFLICT);
+        }
+
+        private boolean sendArpProbe() {
+            return mIpConflictDetector.transmitPacket(mTargetIp /* target IP */,
+                    INADDR_ANY /* sender IP */, mHwAddr, mInterfaceBroadcastAddr);
+        }
+
+        private boolean sendArpAnnounce() {
+            return mIpConflictDetector.transmitPacket(mTargetIp /* target IP */,
+                    mTargetIp /* sender IP */, mHwAddr, mInterfaceBroadcastAddr);
+        }
+    }
+
     class DhcpBoundState extends LoggingState {
         @Override
         public void enter() {
@@ -1165,11 +1631,7 @@ public class DhcpClient extends StateMachine {
             super.processMessage(message);
             switch (message.what) {
                 case CMD_RENEW_DHCP:
-                    if (mRegisteredForPreDhcpNotification) {
-                        transitionTo(mWaitBeforeRenewalState);
-                    } else {
-                        transitionTo(mDhcpRenewingState);
-                    }
+                    preDhcpTransitionTo(mWaitBeforeRenewalState, mDhcpRenewingState);
                     return HANDLED;
                 default:
                     return NOT_HANDLED;
@@ -1303,10 +1765,10 @@ public class DhcpClient extends StateMachine {
         @Override
         protected boolean sendPacket() {
             return sendRequestPacket(
-                     INADDR_ANY,                                       // ciaddr
-                     mLastAssignedIpv4Address,                         // DHCP_REQUESTED_IP
-                     null,                                             // DHCP_SERVER_IDENTIFIER
-                     INADDR_BROADCAST);                                // packet destination address
+                    INADDR_ANY,                                        // ciaddr
+                    mLastAssignedIpv4Address,                          // DHCP_REQUESTED_IP
+                    null,                                              // DHCP_SERVER_IDENTIFIER
+                    INADDR_BROADCAST);                                 // packet destination address
         }
 
         @Override
@@ -1317,6 +1779,34 @@ public class DhcpClient extends StateMachine {
     }
 
     class DhcpRebootingState extends LoggingState {
+    }
+
+    class DhcpDecliningState extends TimeoutState {
+        @Override
+        public void enter() {
+            // If the host experiences MAX_CONFLICTS or more address conflicts on the
+            // interface, configure interface with this IP address anyway.
+            if (++mConflictCount > MAX_CONFLICTS_COUNT) {
+                transitionTo(mConfiguringInterfaceState);
+                return;
+            }
+
+            mTimeout = mDependencies.getIntDeviceConfig(DHCP_RESTART_CONFIG_DELAY);
+            super.enter();
+            sendPacket();
+        }
+
+        // No need to override processMessage here since this state is
+        // functionally identical to its superclass TimeoutState.
+        protected void timeout() {
+            transitionTo(mDhcpInitState);
+        }
+
+        private boolean sendPacket() {
+            return sendDeclinePacket(
+                    (Inet4Address) mDhcpLease.ipAddress.getAddress(),  // requested IP
+                    (Inet4Address) mDhcpLease.serverAddress);          // serverIdentifier
+        }
     }
 
     private void logState(String name, int durationMs) {
