@@ -64,10 +64,14 @@ import static org.mockito.Mockito.when;
 import android.annotation.NonNull;
 import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.content.res.Resources;
 import android.net.ConnectivityManager;
 import android.net.DnsResolver;
+import android.net.INetd;
 import android.net.INetworkMonitorCallbacks;
 import android.net.LinkProperties;
 import android.net.Network;
@@ -87,6 +91,11 @@ import android.os.Process;
 import android.os.RemoteException;
 import android.os.SystemClock;
 import android.provider.Settings;
+import android.telephony.CellIdentityGsm;
+import android.telephony.CellIdentityLte;
+import android.telephony.CellInfo;
+import android.telephony.CellInfoGsm;
+import android.telephony.CellInfoLte;
 import android.telephony.CellSignalStrength;
 import android.telephony.TelephonyManager;
 import android.util.ArrayMap;
@@ -133,6 +142,7 @@ public class NetworkMonitorTest {
     private static final String LOCATION_HEADER = "location";
 
     private @Mock Context mContext;
+    private @Mock Configuration mConfiguration;
     private @Mock Resources mResources;
     private @Mock IpConnectivityLog mLogger;
     private @Mock SharedLog mValidationLogger;
@@ -154,6 +164,7 @@ public class NetworkMonitorTest {
     private @Mock WifiInfo mWifiInfo;
     private @Captor ArgumentCaptor<String> mNetworkTestedRedirectUrlCaptor;
     private @Mock TcpSocketTracker.Dependencies mTstDependencies;
+    private @Mock INetd mNetd;
     private @Mock TcpSocketTracker mTst;
     private HashSet<WrappedNetworkMonitor> mCreatedNetworkMonitors;
     private HashSet<BroadcastReceiver> mRegisteredReceivers;
@@ -362,6 +373,7 @@ public class NetworkMonitorTest {
         setFallbackSpecs(null); // Test with no fallback spec by default
         when(mRandom.nextInt()).thenReturn(0);
 
+        when(mTstDependencies.getNetd()).thenReturn(mNetd);
         // DNS probe timeout should not be defined more than half of HANDLER_TIMEOUT_MS. Otherwise,
         // it will fail the test because of timeout expired for querying AAAA and A sequentially.
         when(mResources.getInteger(eq(R.integer.config_captive_portal_dns_probe_timeout)))
@@ -484,6 +496,10 @@ public class NetworkMonitorTest {
             assertTrue("NetworkMonitor did not quit after " + HANDLER_TIMEOUT_MS + "ms",
                     mQuitCv.block(HANDLER_TIMEOUT_MS));
         }
+
+        protected Context getContext() {
+            return mContext;
+        }
     }
 
     private WrappedNetworkMonitor makeMonitor(NetworkCapabilities nc) {
@@ -510,6 +526,45 @@ public class NetworkMonitorTest {
     private void setNetworkCapabilities(NetworkMonitor nm, NetworkCapabilities nc) {
         nm.notifyNetworkCapabilitiesChanged(nc);
         HandlerUtilsKt.waitForIdle(nm.getHandler(), HANDLER_TIMEOUT_MS);
+    }
+
+    @Test
+    public void testGetLocationMcc() throws Exception {
+        final WrappedNetworkMonitor wnm = makeNotMeteredNetworkMonitor();
+        doReturn(PackageManager.PERMISSION_DENIED).when(mContext).checkPermission(
+                eq(android.Manifest.permission.ACCESS_FINE_LOCATION),  anyInt(), anyInt());
+        assertNull(wnm.getLocationMcc());
+        doReturn(PackageManager.PERMISSION_GRANTED).when(mContext).checkPermission(
+                eq(android.Manifest.permission.ACCESS_FINE_LOCATION),  anyInt(), anyInt());
+        doReturn(new ContextWrapper(mContext)).when(mContext).createConfigurationContext(any());
+        // Prepare CellInfo and check if the vote mechanism is working or not.
+        final CellInfoGsm cellInfoGsm1 = new CellInfoGsm();
+        final CellInfoGsm cellInfoGsm2 = new CellInfoGsm();
+        final CellInfoLte cellInfoLte = new CellInfoLte();
+        final CellIdentityGsm cellIdentityGsm =
+                new CellIdentityGsm(0, 0, 0, 0, "460", "01", "", "");
+        final CellIdentityLte cellIdentityLte =
+                new CellIdentityLte(0, 0, 0, 0, 0, "466", "01", "", "");
+        cellInfoGsm1.setCellIdentity(cellIdentityGsm);
+        cellInfoGsm2.setCellIdentity(cellIdentityGsm);
+        cellInfoLte.setCellIdentity(cellIdentityLte);
+        final List<CellInfo> cellList = new ArrayList<CellInfo>();
+        cellList.add(cellInfoGsm1);
+        cellList.add(cellInfoGsm2);
+        cellList.add(cellInfoLte);
+        doReturn(cellList).when(mTelephony).getAllCellInfo();
+        // The count of 460 is 2 and the count of 466 is 1, so the getLocationMcc() should return
+        // 460.
+        assertEquals("460", wnm.getLocationMcc());
+        // getContextByMccIfNoSimCardOrDefault() shouldn't return mContext when using neighbor mcc
+        // is enabled and the sim is not ready.
+        doReturn(true).when(mResources).getBoolean(R.bool.config_no_sim_card_uses_neighbor_mcc);
+        doReturn(TelephonyManager.SIM_STATE_ABSENT).when(mTelephony).getSimState();
+        doReturn(mConfiguration).when(mResources).getConfiguration();
+        assertEquals(460,
+                wnm.getContextByMccIfNoSimCardOrDefault().getResources().getConfiguration().mcc);
+        doReturn(false).when(mResources).getBoolean(R.bool.config_no_sim_card_uses_neighbor_mcc);
+        assertEquals(wnm.getContext(), wnm.getContextByMccIfNoSimCardOrDefault());
     }
 
     @Test
