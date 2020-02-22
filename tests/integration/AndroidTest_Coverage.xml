@@ -13,16 +13,14 @@
      See the License for the specific language governing permissions and
      limitations under the License.
 -->
-<configuration description="Runs Integration Tests for NetworkStack">
+<configuration description="Runs coverage tests for NetworkStack">
     <target_preparer class="com.android.tradefed.targetprep.TestAppInstallSetup">
-        <option name="test-file-name" value="NetworkStackIntegrationTests.apk" />
+        <option name="test-file-name" value="NetworkStackCoverageTests.apk" />
     </target_preparer>
 
-    <option name="test-suite-tag" value="apct" />
-    <option name="test-suite-tag" value="framework-base-presubmit" />
-    <option name="test-tag" value="NetworkStackIntegrationTests" />
+    <option name="test-tag" value="NetworkStackCoverageTests" />
     <test class="com.android.tradefed.testtype.AndroidJUnitTest" >
-        <option name="package" value="com.android.server.networkstack.integrationtests" />
+        <option name="package" value="com.android.server.networkstack.coverage" />
         <option name="runner" value="androidx.test.runner.AndroidJUnitRunner" />
         <option name="hidden-api-checks" value="false"/>
     </test>
