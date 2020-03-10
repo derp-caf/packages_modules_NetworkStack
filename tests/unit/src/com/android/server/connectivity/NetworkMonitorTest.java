@@ -94,7 +94,6 @@ import android.net.INetworkMonitorCallbacks;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
-import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.captiveportal.CaptivePortalProbeResult;
 import android.net.metrics.IpConnectivityLog;
@@ -179,7 +178,6 @@ public class NetworkMonitorTest {
     private @Mock Resources mResources;
     private @Mock IpConnectivityLog mLogger;
     private @Mock SharedLog mValidationLogger;
-    private @Mock NetworkInfo mNetworkInfo;
     private @Mock DnsResolver mDnsResolver;
     private @Mock ConnectivityManager mCm;
     private @Mock TelephonyManager mTelephony;
@@ -419,7 +417,6 @@ public class NetworkMonitorTest {
         when(mResources.getString(anyInt())).thenReturn("");
         when(mResources.getStringArray(anyInt())).thenReturn(new String[0]);
 
-        when(mNetworkInfo.getType()).thenReturn(ConnectivityManager.TYPE_WIFI);
         setFallbackUrl(TEST_FALLBACK_URL);
         setOtherFallbackUrls(TEST_OTHER_FALLBACK_URL);
         setFallbackSpecs(null); // Test with no fallback spec by default
@@ -642,8 +639,9 @@ public class NetworkMonitorTest {
             int bandwidth, String mccStr, String mncStr, String alphal, String alphas)
             throws ReflectiveOperationException {
         if (ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
-            return new CellIdentityLte(ci, pci, tac, earfcn, bandwidth, mccStr, mncStr, alphal,
-                    alphas, Collections.emptyList() /* additionalPlmns */, null /* csgInfo */);
+            return new CellIdentityLte(ci, pci, tac, earfcn, Collections.emptyList() /* bands */,
+                    bandwidth, mccStr, mncStr, alphal, alphas,
+                    Collections.emptyList() /* additionalPlmns */, null /* csgInfo */);
         } else {
             // API <= Q does not have the additionalPlmns and csgInfo parameters
             final Constructor<CellIdentityLte> constructor = CellIdentityLte.class.getConstructor(
