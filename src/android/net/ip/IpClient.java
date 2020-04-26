@@ -32,6 +32,7 @@ import android.net.Layer2InformationParcelable;
 import android.net.Layer2PacketParcelable;
 import android.net.LinkAddress;
 import android.net.LinkProperties;
+import android.net.MacAddress;
 import android.net.NattKeepalivePacketDataParcelable;
 import android.net.NetworkStackIpMemoryStore;
 import android.net.ProvisioningConfigurationParcelable;
@@ -92,6 +93,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -381,7 +383,8 @@ public class IpClient extends StateMachine {
     private static final int CMD_ADD_KEEPALIVE_PACKET_FILTER_TO_APF = 13;
     private static final int CMD_REMOVE_KEEPALIVE_PACKET_FILTER_FROM_APF = 14;
     private static final int CMD_UPDATE_L2KEY_GROUPHINT = 15;
-    protected static final int CMD_COMPLETE_PRECONNECTION = 16;
+    private static final int CMD_COMPLETE_PRECONNECTION = 16;
+    private static final int CMD_UPDATE_L2INFORMATION = 17;
 
     // Internal commands to use instead of trying to call transitionTo() inside
     // a given State's enter() method. Calling transitionTo() from enter/exit
@@ -421,6 +424,14 @@ public class IpClient extends StateMachine {
     private static final List<byte[]> METERED_IE_PATTERN_LIST = Collections.unmodifiableList(
             Arrays.asList(
                     new byte[] { (byte) 0x00, (byte) 0x17, (byte) 0xf2, (byte) 0x06 }
+    ));
+
+    // Initialize configurable particular SSID set supporting DHCP Roaming feature. See
+    // b/131797393 for more details.
+    private static final Set<String> DHCP_ROAMING_SSID_SET = new HashSet<>(
+            Arrays.asList(
+                    "0001docomo", "ollehWiFi", "olleh GiGa WiFi", "KT WiFi",
+                    "KT GiGA WiFi", "marente"
     ));
 
     private final State mStoppedState = new StoppedState();
@@ -470,6 +481,7 @@ public class IpClient extends StateMachine {
     private String mGroupHint; // The group hint for this network, for writing into the memory store
     private boolean mMulticastFiltering;
     private long mStartTimeMillis;
+    private MacAddress mCurrentBssid;
 
     /**
      * Reading the snapshot is an asynchronous operation initiated by invoking
@@ -571,7 +583,8 @@ public class IpClient extends StateMachine {
 
         mLinkObserver = new IpClientLinkObserver(
                 mInterfaceName,
-                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED), config) {
+                () -> sendMessage(EVENT_NETLINK_LINKPROPERTIES_CHANGED),
+                config, getHandler(), mLog) {
             @Override
             public void onInterfaceAdded(String iface) {
                 super.onInterfaceAdded(iface);
@@ -704,7 +717,6 @@ public class IpClient extends StateMachine {
             enforceNetworkStackCallingPermission();
             IpClient.this.notifyPreconnectionComplete(success);
         }
-
         @Override
         public void updateLayer2Information(Layer2InformationParcelable info) {
             enforceNetworkStackCallingPermission();
@@ -772,6 +784,21 @@ public class IpClient extends StateMachine {
             return;
         }
 
+        final ScanResultInfo scanResultInfo = req.mScanResultInfo;
+        mCurrentBssid = null;
+        if (scanResultInfo != null) {
+            try {
+                mCurrentBssid = MacAddress.fromString(scanResultInfo.getBssid());
+            } catch (IllegalArgumentException e) {
+                Log.wtf(mTag, "Invalid BSSID: " + scanResultInfo.getBssid()
+                        + " in provisioning configuration", e);
+            }
+        }
+
+        if (req.mLayer2Info != null) {
+            mL2Key = req.mLayer2Info.mL2Key;
+            mGroupHint = req.mLayer2Info.mGroupHint;
+        }
         sendMessage(CMD_START, new android.net.shared.ProvisioningConfiguration(req));
     }
 
@@ -819,9 +846,14 @@ public class IpClient extends StateMachine {
 
     /**
      * Set the L2 key and group hint for storing info into the memory store.
+     *
+     * This method is only supported on Q devices. For R or above releases,
+     * caller should call #updateLayer2Information() instead.
      */
     public void setL2KeyAndGroupHint(String l2Key, String groupHint) {
-        sendMessage(CMD_UPDATE_L2KEY_GROUPHINT, new Pair<>(l2Key, groupHint));
+        if (!ShimUtils.isReleaseOrDevelopmentApiAbove(Build.VERSION_CODES.Q)) {
+            sendMessage(CMD_UPDATE_L2KEY_GROUPHINT, new Pair<>(l2Key, groupHint));
+        }
     }
 
     /**
@@ -877,10 +909,10 @@ public class IpClient extends StateMachine {
     }
 
     /**
-     * Update the network bssid, L2Key and GroupHint layer2 information.
+     * Update the network bssid, L2Key and GroupHint on L2 roaming happened.
      */
     public void updateLayer2Information(@NonNull Layer2InformationParcelable info) {
-        // TODO: add specific implementation.
+        sendMessage(CMD_UPDATE_L2INFORMATION, info);
     }
 
     /**
@@ -1199,6 +1231,7 @@ public class IpClient extends StateMachine {
             newLp.addRoute(route);
         }
         addAllReachableDnsServers(newLp, netlinkLinkProperties.getDnsServers());
+        newLp.setNat64Prefix(netlinkLinkProperties.getNat64Prefix());
 
         // [3] Add in data from DHCPv4, if available.
         //
@@ -1502,11 +1535,42 @@ public class IpClient extends StateMachine {
         }
     }
 
+    private void handleUpdateL2Information(@NonNull Layer2InformationParcelable info) {
+        mL2Key = info.l2Key;
+        mGroupHint = info.groupHint;
+
+        if (info.bssid == null || mCurrentBssid == null) {
+            Log.wtf(mTag, "bssid in the parcelable or current tracked bssid should be non-null");
+            return;
+        }
+
+        // If the BSSID has not changed, there is nothing to do.
+        if (info.bssid.equals(mCurrentBssid)) return;
+
+        if (mIpReachabilityMonitor != null) {
+            mIpReachabilityMonitor.probeAll();
+        }
+
+        // Check whether to refresh previous IP lease on L2 roaming happened.
+        final String ssid = removeDoubleQuotes(mConfiguration.mDisplayName);
+        if (DHCP_ROAMING_SSID_SET.contains(ssid) && mDhcpClient != null) {
+            if (DBG) {
+                Log.d(mTag, "L2 roaming happened from " + mCurrentBssid
+                        + " to " + info.bssid
+                        + " , SSID: " + ssid
+                        + " , starting refresh leased IP address");
+            }
+            mDhcpClient.sendMessage(DhcpClient.CMD_REFRESH_LINKADDRESS);
+        }
+        mCurrentBssid = info.bssid;
+    }
+
     class StoppedState extends State {
         @Override
         public void enter() {
             stopAllIP();
 
+            mLinkObserver.clearInterfaceParams();
             resetLinkProperties();
             if (mStartTimeMillis > 0) {
                 // Completed a life-cycle; send a final empty LinkProperties
@@ -1652,6 +1716,7 @@ public class IpClient extends StateMachine {
                 transitionTo(mStoppedState);
                 return;
             }
+            mLinkObserver.setInterfaceParams(mInterfaceParams);
             mCallback.setNeighborDiscoveryOffload(true);
         }
 
@@ -1762,6 +1827,10 @@ public class IpClient extends StateMachine {
                     // inputting current values for what may be a different L3 network.
                     break;
                 }
+
+                case CMD_UPDATE_L2INFORMATION:
+                    handleUpdateL2Information((Layer2InformationParcelable) msg.obj);
+                    break;
 
                 case EVENT_PROVISIONING_TIMEOUT:
                     handleProvisioningFailure();
