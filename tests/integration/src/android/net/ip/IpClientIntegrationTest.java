@@ -60,6 +60,9 @@ import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.contains;
+import static org.mockito.ArgumentMatchers.longThat;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.doAnswer;
@@ -75,6 +78,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import android.app.AlarmManager;
+import android.app.AlarmManager.OnAlarmListener;
 import android.app.Instrumentation;
 import android.content.ContentResolver;
 import android.content.Context;
@@ -117,6 +121,7 @@ import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.PowerManager;
 import android.os.RemoteException;
+import android.os.SystemClock;
 import android.os.SystemProperties;
 import android.system.ErrnoException;
 import android.system.Os;
@@ -127,8 +132,10 @@ import androidx.test.runner.AndroidJUnit4;
 
 import com.android.internal.util.StateMachine;
 import com.android.networkstack.apishim.CaptivePortalDataShimImpl;
+import com.android.networkstack.apishim.ConstantsShim;
 import com.android.networkstack.apishim.ShimUtils;
 import com.android.networkstack.arp.ArpPacket;
+import com.android.server.NetworkObserver;
 import com.android.server.NetworkObserverRegistry;
 import com.android.server.NetworkStackService.NetworkStackServiceManager;
 import com.android.server.connectivity.ipmemorystore.IpMemoryStoreService;
@@ -162,6 +169,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Objects;
 import java.util.Random;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Tests for IpClient.
@@ -193,6 +202,7 @@ public class IpClientIntegrationTest {
     @Spy private INetd mNetd;
 
     private String mIfaceName;
+    private NetworkObserverRegistry mNetworkObserverRegistry;
     private HandlerThread mPacketReaderThread;
     private Handler mHandler;
     private TapPacketReader mPacketReader;
@@ -435,10 +445,32 @@ public class IpClientIntegrationTest {
         when(mContext.getSystemService(eq(Context.NETD_SERVICE))).thenReturn(netdIBinder);
         assertNotNull(mNetd);
 
-        final NetworkObserverRegistry reg = new NetworkObserverRegistry();
-        reg.register(mNetd);
-        mIpc = new IpClient(mContext, mIfaceName, mCb, reg, mNetworkStackServiceManager,
-                mDependencies);
+        mNetworkObserverRegistry = new NetworkObserverRegistry();
+        mNetworkObserverRegistry.register(mNetd);
+        mIpc = new IpClient(mContext, mIfaceName, mCb, mNetworkObserverRegistry,
+                mNetworkStackServiceManager, mDependencies);
+    }
+
+    private void expectAlarmCancelled(InOrder inOrder, OnAlarmListener listener) {
+        inOrder.verify(mAlarm, timeout(TEST_TIMEOUT_MS)).cancel(eq(listener));
+    }
+
+    private OnAlarmListener expectAlarmSet(InOrder inOrder, String tagMatch, int afterSeconds) {
+        // Allow +/- 3 seconds to prevent flaky tests.
+        final long when = SystemClock.elapsedRealtime() + afterSeconds * 1000;
+        final long min = when - 3 * 1000;
+        final long max = when + 3 * 1000;
+        ArgumentCaptor<OnAlarmListener> captor = ArgumentCaptor.forClass(OnAlarmListener.class);
+        if (inOrder != null) {
+            inOrder.verify(mAlarm, timeout(TEST_TIMEOUT_MS)).setExact(
+                    anyInt(), longThat(x -> x >= min && x <= max),
+                    contains(tagMatch), captor.capture(), eq(mIpc.getHandler()));
+        } else {
+            verify(mAlarm, timeout(TEST_TIMEOUT_MS)).setExact(
+                    anyInt(), longThat(x -> x >= min && x <= max),
+                    contains(tagMatch), captor.capture(), eq(mIpc.getHandler()));
+        }
+        return captor.getValue();
     }
 
     private boolean packetContainsExpectedField(final byte[] packet, final int offset,
@@ -1085,6 +1117,8 @@ public class IpClientIntegrationTest {
 
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
     public void testDhcpServerInLinkProperties() throws Exception {
+        assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
+
         performDhcpHandshake();
         ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
         verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
@@ -1170,6 +1204,19 @@ public class IpClientIntegrationTest {
             if (isRouterSolicitation(packet)) return;
         }
         fail("No router solicitation received on interface within timeout");
+    }
+
+    private void sendBasicRouterAdvertisement(boolean waitForRs) throws Exception {
+        final String dnsServer = "2001:4860:4860::64";
+        final ByteBuffer pio = buildPioOption(3600, 1800, "2001:db8:1::/64");
+        ByteBuffer rdnss = buildRdnssOption(3600, dnsServer);
+        ByteBuffer ra = buildRaPacket(pio, rdnss);
+
+        if (waitForRs) {
+            waitForRouterSolicitation();
+        }
+
+        mPacketReader.sendResponse(ra);
     }
 
     // TODO: move this and the following method to a common location and use them in ApfTest.
@@ -1351,14 +1398,15 @@ public class IpClientIntegrationTest {
     }
 
     private void expectNoNat64PrefixUpdate(InOrder inOrder, IpPrefix unchanged) throws Exception {
-        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
-        inOrder.verify(mCb, never()).onLinkPropertiesChange(argThat(
+        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS).times(0)).onLinkPropertiesChange(argThat(
                 lp -> !Objects.equals(unchanged, lp.getNat64Prefix())));
 
     }
 
     @Test @IgnoreUpTo(Build.VERSION_CODES.Q)
     public void testPref64Option() throws Exception {
+        assumeTrue(ConstantsShim.VERSION > Build.VERSION_CODES.Q);
+
         disableRouterSolicitationDelay();
 
         ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
@@ -1379,11 +1427,16 @@ public class IpClientIntegrationTest {
         waitForRouterSolicitation();
         mPacketReader.sendResponse(ra);
 
-        InOrder inOrder = inOrder(mCb);
+        // The NAT64 prefix might be detected before or after provisioning success.
+        // Don't test order between these two events.
         ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
-        inOrder.verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        expectAlarmSet(null /*inOrder*/, "PREF64", 600);
+        reset(mCb, mAlarm);
 
-        // The NAT64 prefix might have been detected before or after provisioning success.
+        // From now on expect events in order.
+        InOrder inOrder = inOrder(mCb, mAlarm);
+
         LinkProperties lp = captor.getValue();
         if (lp.getNat64Prefix() != null) {
             assertEquals(prefix, lp.getNat64Prefix());
@@ -1395,30 +1448,93 @@ public class IpClientIntegrationTest {
         pref64 = new StructNdOptPref64(prefix, 1800).toByteBuffer();
         ra = buildRaPacket(pio, rdnss, pref64);
         mPacketReader.sendResponse(ra);
+        OnAlarmListener pref64Alarm = expectAlarmSet(inOrder, "PREF64", 1800);
         expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
+
+        // Reduce the lifetime and expect to reschedule expiry.
+        pref64 = new StructNdOptPref64(prefix, 1500).toByteBuffer();
+        ra = buildRaPacket(pio, rdnss, pref64);
+        mPacketReader.sendResponse(ra);
+        pref64Alarm = expectAlarmSet(inOrder, "PREF64", 1496);
+        expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
 
         // Withdraw the prefix and expect it to be set to null.
         pref64 = new StructNdOptPref64(prefix, 0).toByteBuffer();
         ra = buildRaPacket(pio, rdnss, pref64);
         mPacketReader.sendResponse(ra);
+        expectAlarmCancelled(inOrder, pref64Alarm);
         expectNat64PrefixUpdate(inOrder, null);
+        reset(mCb, mAlarm);
 
         // Re-announce the prefix.
         pref64 = new StructNdOptPref64(prefix, 600).toByteBuffer();
         ra = buildRaPacket(pio, rdnss, pref64);
         mPacketReader.sendResponse(ra);
+        expectAlarmSet(inOrder, "PREF64", 600);
         expectNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
 
         // Announce two prefixes. Don't expect any update because if there is already a NAT64
         // prefix, any new prefix is ignored.
-        ByteBuffer otherPref64 = new StructNdOptPref64(otherPrefix, 600).toByteBuffer();
+        ByteBuffer otherPref64 = new StructNdOptPref64(otherPrefix, 1200).toByteBuffer();
         ra = buildRaPacket(pio, rdnss, pref64, otherPref64);
         mPacketReader.sendResponse(ra);
+        expectAlarmSet(inOrder, "PREF64", 600);
+        expectNoNat64PrefixUpdate(inOrder, prefix);
+        reset(mCb, mAlarm);
 
+        // Withdraw the old prefix and continue to announce the new one. Expect a prefix change.
         pref64 = new StructNdOptPref64(prefix, 0).toByteBuffer();
         ra = buildRaPacket(pio, rdnss, pref64, otherPref64);
         mPacketReader.sendResponse(ra);
+        expectAlarmCancelled(inOrder, pref64Alarm);
+        // Need a different OnAlarmListener local variable because posting it to the handler in the
+        // lambda below requires it to be final.
+        final OnAlarmListener lastAlarm = expectAlarmSet(inOrder, "PREF64", 1200);
         expectNat64PrefixUpdate(inOrder, otherPrefix);
+        reset(mCb, mAlarm);
+
+        // Simulate prefix expiry.
+        mIpc.getHandler().post(() -> lastAlarm.onAlarm());
+        expectAlarmCancelled(inOrder, pref64Alarm);
+        expectNat64PrefixUpdate(inOrder, null);
+    }
+
+    private void addIpAddressAndWaitForIt(final String iface) throws Exception {
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        final String addr1 = "192.0.2.99";
+        final String addr2 = "192.0.2.3";
+        final int prefixLength = 26;
+
+        // Add two IPv4 addresses to the specified interface, and proceed when the NetworkObserver
+        // has seen the second one. This ensures that every other NetworkObserver registered with
+        // mNetworkObserverRegistry - in particular, IpClient's - has seen the addition of the first
+        // address.
+        final LinkAddress trigger = new LinkAddress(addr2 + "/" + prefixLength);
+        NetworkObserver observer = new NetworkObserver() {
+            @Override
+            public void onInterfaceAddressUpdated(LinkAddress address, String ifName) {
+                if (ifName.equals(iface) && address.isSameAddressAs(trigger)) {
+                    latch.countDown();
+                }
+            }
+        };
+
+        mNetworkObserverRegistry.registerObserverForNonblockingCallback(observer);
+        try {
+            mNetd.interfaceAddAddress(iface, addr1, prefixLength);
+            mNetd.interfaceAddAddress(iface, addr2, prefixLength);
+            assertTrue("Trigger IP address " + addr2 + " not seen after " + TEST_TIMEOUT_MS + "ms",
+                    latch.await(TEST_TIMEOUT_MS, TimeUnit.MILLISECONDS));
+        } finally {
+            mNetworkObserverRegistry.unregisterObserver(observer);
+        }
+
+        // Wait for IpClient to process the addition of the address.
+        HandlerUtilsKt.waitForIdle(mIpc.getHandler(), TEST_TIMEOUT_MS);
     }
 
     @Test
@@ -1439,14 +1555,31 @@ public class IpClientIntegrationTest {
 
         // Pretend that something else (e.g., Tethering) used the interface and left an IP address
         // configured on it. When IpClient starts, it must clear this address before proceeding.
-        // TODO: test IPv6 instead, since the DHCP client will remove this address by replacing it
-        // with the new address.
-        mNetd.interfaceAddAddress(mIfaceName, "192.0.2.99", 26);
+        // The address must be noticed before startProvisioning is called, or IpClient will
+        // immediately declare provisioning success due to the presence of an IPv4 address.
+        // The address must be IPv4 because IpClient clears IPv6 addresses on startup.
+        //
+        // TODO: once IpClient gets IP addresses directly from netlink instead of from netd, it
+        // may be sufficient to call waitForIdle to see if IpClient has seen the address.
+        addIpAddressAndWaitForIt(mIfaceName);
 
-        // start IpClient again and should enter Clearing State and wait for the message from kernel
-        performDhcpHandshake(true /* isSuccessLease */, TEST_LEASE_DURATION_S,
-                true /* isDhcpLeaseCacheEnabled */, false /* shouldReplyRapidCommitAck */,
-                TEST_DEFAULT_MTU, false /* isDhcpIpConflictDetectEnabled */);
+        disableRouterSolicitationDelay();
+
+        ProvisioningConfiguration config = new ProvisioningConfiguration.Builder()
+                .withoutIpReachabilityMonitor()
+                .build();
+        mIpc.startProvisioning(config);
+
+        sendBasicRouterAdvertisement(true /*waitForRs*/);
+
+        // Check that the IPv4 addresses configured earlier are not in LinkProperties...
+        ArgumentCaptor<LinkProperties> captor = ArgumentCaptor.forClass(LinkProperties.class);
+        verify(mCb, timeout(TEST_TIMEOUT_MS)).onProvisioningSuccess(captor.capture());
+        assertFalse(captor.getValue().hasIpv4Address());
+
+        // ... or configured on the interface.
+        InterfaceConfigurationParcel cfg = mNetd.interfaceGetCfg(mIfaceName);
+        assertEquals("0.0.0.0", cfg.ipv4Addr);
     }
 
     @Test
